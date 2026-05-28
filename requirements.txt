@@ -5,3 +5,5 @@ onnxruntime==1.16.1
 onnxsim==0.4.33
 ptflops==0.7
 torch==1.11.0
+torchaudio==0.11.0
+speechbrain
