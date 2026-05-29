@@ -584,7 +584,16 @@ def main():
     monitor = cfg["training"]["checkpoint"]["monitor"].split("/")[-1]
     mode = cfg["training"]["checkpoint"]["mode"]
     use_progress = not args.no_progress
-    for epoch in range(start_epoch + 1, int(cfg["training"]["epochs"]) + 1):
+    total_epochs = int(cfg["training"]["epochs"])
+    if start_epoch >= total_epochs:
+        print(
+            f"Checkpoint is already at epoch={start_epoch}, target epochs={total_epochs}. "
+            "Nothing to train. Increase --epochs, use a new --output-dir, or disable auto-resume for a fresh run.",
+            flush=True,
+        )
+        return
+
+    for epoch in range(start_epoch + 1, total_epochs + 1):
         train_loss, train_metrics, elapsed = train_one_epoch(
             model, train_loader, optimizer, cfg, window, device, eval_ecapa, epoch, use_progress=use_progress
         )
