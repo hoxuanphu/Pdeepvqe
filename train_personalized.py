@@ -1,6 +1,7 @@
 import argparse
 import json
 import random
+import sys
 import time
 from pathlib import Path
 
@@ -10,7 +11,7 @@ import torchaudio
 from torch.utils.data import DataLoader, Dataset
 
 try:
-    from tqdm.auto import tqdm
+    from tqdm import tqdm
 except ImportError:
     tqdm = None
 
@@ -361,7 +362,17 @@ def format_progress(values):
 
 def progress_iter(iterable, total, desc, enabled=True, leave=False):
     if enabled and tqdm is not None:
-        return tqdm(iterable, total=total, desc=desc, dynamic_ncols=True, leave=leave)
+        return tqdm(
+            iterable,
+            total=total,
+            desc=desc,
+            dynamic_ncols=True,
+            leave=leave,
+            file=sys.stdout,
+            mininterval=1.0,
+            miniters=1,
+            ascii=True,
+        )
     return iterable
 
 
@@ -409,6 +420,7 @@ def train_one_epoch(model, loader, optimizer, cfg, window, device, eval_ecapa, e
     loss_values = []
     metric_values = []
     start = time.time()
+    print(f"Starting epoch {epoch} train: {len(loader)} batches", flush=True)
     iterator = progress_iter(loader, total=len(loader), desc=f"epoch {epoch} train", enabled=use_progress)
     for batch_index, batch in enumerate(iterator):
         optimizer.zero_grad()
@@ -434,7 +446,7 @@ def train_one_epoch(model, loader, optimizer, cfg, window, device, eval_ecapa, e
         if (batch_index + 1) % 20 == 0:
             avg_loss = average_dict(loss_values[-20:])
             avg_metric = average_dict(metric_values[-20:])
-            print(f"epoch={epoch} step={batch_index + 1}/{len(loader)} loss={avg_loss} metrics={avg_metric}")
+            print(f"epoch={epoch} step={batch_index + 1}/{len(loader)} loss={avg_loss} metrics={avg_metric}", flush=True)
 
     return average_dict(loss_values), average_dict(metric_values), time.time() - start
 
@@ -445,6 +457,7 @@ def validate(model, loader, cfg, window, device, eval_ecapa, epoch=None, use_pro
     loss_values = []
     metric_values = []
     desc = f"epoch {epoch} valid" if epoch is not None else "valid"
+    print(f"Starting {desc}: {len(loader)} batches", flush=True)
     iterator = progress_iter(loader, total=len(loader), desc=desc, enabled=use_progress)
     for batch_index, batch in enumerate(iterator):
         loss, loss_parts, metrics = compute_batch(
@@ -520,9 +533,9 @@ def main():
         auto_resume_path = output_dir / "last.pt"
         if auto_resume_path.exists():
             cfg["experiment"]["resume_from"] = str(auto_resume_path)
-            print(f"Auto-resume: found checkpoint {auto_resume_path}")
+            print(f"Auto-resume: found checkpoint {auto_resume_path}", flush=True)
         else:
-            print(f"Auto-resume: no checkpoint found at {auto_resume_path}; starting from scratch.")
+            print(f"Auto-resume: no checkpoint found at {auto_resume_path}; starting from scratch.", flush=True)
 
     seed_everything(int(cfg["experiment"]["seed"]))
     requested_device = cfg["training"]["device"]
@@ -531,9 +544,12 @@ def main():
     with (output_dir / "config.json").open("w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
 
+    print("Building dataloaders...", flush=True)
     train_loader = make_loader(cfg["data"]["train_manifest"], cfg, "train", args.data_root)
     valid_loader = make_loader(cfg["data"]["valid_manifest"], cfg, "valid", args.data_root)
+    print(f"Train batches: {len(train_loader)} | Valid batches: {len(valid_loader)}", flush=True)
 
+    print(f"Building model on {device}...", flush=True)
     model = make_model(cfg, device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -548,6 +564,7 @@ def main():
         patience=int(cfg["scheduler"]["patience"]),
         min_lr=float(cfg["scheduler"]["min_lr"]),
     )
+    print("Loading eval ECAPA if enabled...", flush=True)
     eval_ecapa = make_eval_ecapa(cfg, device)
 
     window = torch.hann_window(int(cfg["stft"]["win_length"]), device=device)
@@ -560,7 +577,8 @@ def main():
         )
         print(
             f"Resumed checkpoint from epoch={start_epoch} "
-            f"best_metric={best_metric} bad_epochs={bad_epochs}"
+            f"best_metric={best_metric} bad_epochs={bad_epochs}",
+            flush=True,
         )
 
     monitor = cfg["training"]["checkpoint"]["monitor"].split("/")[-1]
@@ -579,7 +597,8 @@ def main():
         print(
             f"epoch={epoch} time={elapsed:.1f}s "
             f"train_loss={train_loss} train_metrics={train_metrics} "
-            f"valid_loss={valid_loss} valid_metrics={valid_metrics}"
+            f"valid_loss={valid_loss} valid_metrics={valid_metrics}",
+            flush=True,
         )
 
         is_current_best = is_better(monitor_value, best_metric, mode)
@@ -595,7 +614,7 @@ def main():
 
         early = cfg["training"]["early_stopping"]
         if early.get("enabled", False) and bad_epochs >= int(early["patience"]):
-            print(f"Early stopping after {bad_epochs} stale epochs. best_{monitor}={best_metric}")
+            print(f"Early stopping after {bad_epochs} stale epochs. best_{monitor}={best_metric}", flush=True)
             break
 
 
