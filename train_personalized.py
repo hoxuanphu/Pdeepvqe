@@ -9,6 +9,11 @@ import torch
 import torchaudio
 from torch.utils.data import DataLoader, Dataset
 
+try:
+    from tqdm.auto import tqdm
+except ImportError:
+    tqdm = None
+
 from deepvqe_personalized import (
     PersonalizedDeepVQE,
     SpeakerEncoder,
@@ -347,6 +352,19 @@ def average_dict(values):
     }
 
 
+def format_progress(values):
+    return {
+        key: f"{value:.4g}" if isinstance(value, float) else value
+        for key, value in values.items()
+    }
+
+
+def progress_iter(iterable, total, desc, enabled=True, leave=False):
+    if enabled and tqdm is not None:
+        return tqdm(iterable, total=total, desc=desc, dynamic_ncols=True, leave=leave)
+    return iterable
+
+
 def make_loader(manifest, cfg, split, data_root):
     dataset = PersonalizedManifestDataset(manifest, cfg, split=split, data_root=data_root)
     return DataLoader(
@@ -386,12 +404,13 @@ def load_checkpoint(path, model, optimizer=None, scheduler=None, device="cpu"):
     return int(ckpt.get("epoch", 0)), ckpt.get("best_metric", None), int(ckpt.get("bad_epochs", 0))
 
 
-def train_one_epoch(model, loader, optimizer, cfg, window, device, eval_ecapa, epoch):
+def train_one_epoch(model, loader, optimizer, cfg, window, device, eval_ecapa, epoch, use_progress=True):
     model.train()
     loss_values = []
     metric_values = []
     start = time.time()
-    for batch_index, batch in enumerate(loader):
+    iterator = progress_iter(loader, total=len(loader), desc=f"epoch {epoch} train", enabled=use_progress)
+    for batch_index, batch in enumerate(iterator):
         optimizer.zero_grad()
         loss, loss_parts, metrics = compute_batch(
             model, batch, cfg, window, device, eval_ecapa=eval_ecapa, batch_index=batch_index, train=True
@@ -404,6 +423,14 @@ def train_one_epoch(model, loader, optimizer, cfg, window, device, eval_ecapa, e
 
         loss_values.append({"loss": float(loss.detach().cpu()), **loss_parts})
         metric_values.append(metrics)
+        if use_progress and hasattr(iterator, "set_postfix"):
+            iterator.set_postfix(
+                format_progress({
+                    "loss": float(loss.detach().cpu()),
+                    **loss_parts,
+                    **metrics,
+                })
+            )
         if (batch_index + 1) % 20 == 0:
             avg_loss = average_dict(loss_values[-20:])
             avg_metric = average_dict(metric_values[-20:])
@@ -413,16 +440,26 @@ def train_one_epoch(model, loader, optimizer, cfg, window, device, eval_ecapa, e
 
 
 @torch.no_grad()
-def validate(model, loader, cfg, window, device, eval_ecapa):
+def validate(model, loader, cfg, window, device, eval_ecapa, epoch=None, use_progress=True):
     model.eval()
     loss_values = []
     metric_values = []
-    for batch_index, batch in enumerate(loader):
+    desc = f"epoch {epoch} valid" if epoch is not None else "valid"
+    iterator = progress_iter(loader, total=len(loader), desc=desc, enabled=use_progress)
+    for batch_index, batch in enumerate(iterator):
         loss, loss_parts, metrics = compute_batch(
             model, batch, cfg, window, device, eval_ecapa=eval_ecapa, batch_index=batch_index, train=False
         )
         loss_values.append({"loss": float(loss.detach().cpu()), **loss_parts})
         metric_values.append(metrics)
+        if use_progress and hasattr(iterator, "set_postfix"):
+            iterator.set_postfix(
+                format_progress({
+                    "loss": float(loss.detach().cpu()),
+                    **loss_parts,
+                    **metrics,
+                })
+            )
     return average_dict(loss_values), average_dict(metric_values)
 
 
@@ -453,6 +490,7 @@ def main():
         action="store_true",
         help="Resume from output_dir/last.pt when it exists and --resume is not set",
     )
+    parser.add_argument("--no-progress", action="store_true", help="Disable tqdm progress bars")
     parser.add_argument("--online-ecapa", action="store_true", help="Load enrollment audio instead of .npy embeddings")
     args = parser.parse_args()
 
@@ -527,11 +565,14 @@ def main():
 
     monitor = cfg["training"]["checkpoint"]["monitor"].split("/")[-1]
     mode = cfg["training"]["checkpoint"]["mode"]
+    use_progress = not args.no_progress
     for epoch in range(start_epoch + 1, int(cfg["training"]["epochs"]) + 1):
         train_loss, train_metrics, elapsed = train_one_epoch(
-            model, train_loader, optimizer, cfg, window, device, eval_ecapa, epoch
+            model, train_loader, optimizer, cfg, window, device, eval_ecapa, epoch, use_progress=use_progress
         )
-        valid_loss, valid_metrics = validate(model, valid_loader, cfg, window, device, eval_ecapa)
+        valid_loss, valid_metrics = validate(
+            model, valid_loader, cfg, window, device, eval_ecapa, epoch=epoch, use_progress=use_progress
+        )
         monitor_value = valid_metrics.get(monitor, -valid_loss.get("loss", 0.0))
         scheduler.step(monitor_value)
 
