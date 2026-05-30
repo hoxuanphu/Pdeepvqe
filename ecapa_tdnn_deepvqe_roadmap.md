@@ -16,10 +16,11 @@ Chuyển đổi bài toán từ Khử nhiễu (Speech Enhancement) thành Trích
 ## Giai đoạn 2: Pipeline Dữ liệu (Data Preparation)
 
 ### 2.1. Cấu trúc Mixture và Tỷ lệ trộn
-Tập dữ liệu huấn luyện nên bao phủ đa dạng các trường hợp. Tỷ lệ trộn khuyến nghị:
-- **70% TSE hoàn chỉnh:** Target + Interfering Speech (1-2 người) + Noise.
-- **15% Chỉ khử nhiễu:** Target + Noise (Không có người nói thứ hai). *Lưu ý: Ở case này VẪN PHẢI truyền đúng Enrollment của Target để ép mô hình hình thành thói quen luôn luôn nhìn vào Embedding.*
-- **15% Chỉ tách giọng:** Target + Interfering Speech (Không có tiếng ồn).
+Tập dữ liệu huấn luyện nên bao phủ đa dạng các trường hợp. Tỷ lệ trộn khuyến nghị (Phiên bản V2 - Hỗ trợ Phase 3):
+- **60% TSE hoàn chỉnh:** Target + Interfering Speech (1-2 người) + Noise.
+- **15% Chỉ khử nhiễu:** Target + Noise (Không có người lạ can thiệp). *Lưu ý: VẪN PHẢI truyền đúng Enrollment của Target để ép mô hình thói quen nhìn vào Embedding.*
+- **15% Chỉ tách giọng:** Target + Interfering Speech (Không có tiếng ồn nền).
+- **10% Tình huống vắng mặt (Negative Case / Absent Speaker):** Mixture chỉ chứa Interferer + Noise, Target bị ép thành mảng số 0 (Silence). Enrollment là giọng của một người không có mặt. Case này đặc biệt quan trọng để chống "ảo giác" mô hình ở Phase 3.
 
 ### 2.2. Room Impulse Response (RIR) và Ground Truth Target
 - **RIR (Mô phỏng vang phòng):** Bắt buộc dùng RIR để chập (convolve) vào âm thanh khô. Nguồn dữ liệu: `RIRS_NOISES` (OpenSLR 28) hoặc `MIT RIR Survey`.
