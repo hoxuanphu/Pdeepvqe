@@ -1,0 +1,10 @@
+experiment:
+  config_id: C1b
+  output_dir: runs/ablation/C1b
+model:
+  activation: elu
+  res_conv_type: dw_separable
+  res_groups:
+  attn_type:
+  gru_hidden: 576
+

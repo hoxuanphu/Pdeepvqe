@@ -1,0 +1,9 @@
+experiment:
+  config_id: Baseline
+  output_dir: runs/ablation/Baseline
+model:
+  prelu_type:
+  dw_residual: false
+  use_eca_f: false
+  main_block_eca_f: false
+  gru_hidden: 576

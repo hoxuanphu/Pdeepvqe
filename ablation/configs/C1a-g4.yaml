@@ -1,0 +1,10 @@
+experiment:
+  config_id: C1a-g4
+  output_dir: runs/ablation/C1a-g4
+model:
+  activation: elu
+  res_conv_type: grouped
+  res_groups: 4
+  attn_type:
+  gru_hidden: 576
+

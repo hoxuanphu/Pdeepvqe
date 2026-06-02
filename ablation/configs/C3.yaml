@@ -1,0 +1,9 @@
+experiment:
+  config_id: C3
+  output_dir: runs/ablation/C3
+model:
+  prelu_type: per_channel
+  dw_residual: true
+  use_eca_f: false
+  main_block_eca_f: false
+  gru_hidden: 576

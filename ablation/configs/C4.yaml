@@ -1,0 +1,9 @@
+experiment:
+  config_id: C4
+  output_dir: runs/ablation/C4
+model:
+  prelu_type: per_channel
+  dw_residual: true
+  use_eca_f: true
+  main_block_eca_f: false
+  gru_hidden: 576
