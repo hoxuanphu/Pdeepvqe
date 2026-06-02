@@ -29,8 +29,8 @@ from ablation.deepvqe_ablation import DeepVQE_Ablation
 
 
 PATH_KEYS = {
-    "mixture": ["mixture", "mixture_path", "mix", "mix_path", "noisy", "input"],
-    "target": ["target", "target_path", "clean", "target_reverb", "target_wav"],
+    "mixture": ["mixture", "mixture_path", "mix", "mix_path", "noisy", "input", "noisy_wav"],
+    "target": ["target", "target_path", "clean", "target_reverb", "target_wav", "clean_wav"],
 }
 
 
@@ -49,6 +49,11 @@ def read_json_manifest(path):
             records = json.load(f)
         if not isinstance(records, list):
             raise ValueError(f"JSON manifest must contain a list: {path}")
+    elif path.suffix.lower() == ".csv":
+        import csv
+        with path.open("r", encoding="utf-8", newline='') as f:
+            reader = csv.DictReader(f)
+            records = list(reader)
     else:
         records = []
         with path.open("r", encoding="utf-8") as f:
