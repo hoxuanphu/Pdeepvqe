@@ -29,8 +29,8 @@ from ablation.deepvqe_ablation import (
 def try_ptflops(model, frames, device):
     try:
         from ptflops import get_model_complexity_info
-    except ImportError:
-        return None, None, "ptflops is not installed"
+    except Exception as exc:
+        return None, None, f"ptflops import failed: {exc}"
 
     try:
         macs, params = get_model_complexity_info(
