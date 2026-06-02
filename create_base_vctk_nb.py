@@ -1,0 +1,350 @@
+import json
+import os
+
+nb = {
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Huấn luyện mô hình gốc DeepVQE với bộ VCTK-DEMAND (VoiceBank-DEMAND)\n",
+    "Notebook này thiết lập môi trường để tải bộ dữ liệu, liên kết Google Drive, clone mã nguồn DeepVQE, xử lý metadata (file csv) và huấn luyện mô hình."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 1. Cài đặt môi trường & Kết nối Google Drive"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": None,
+   "metadata": {},
+   "source": [
+    "!pip install torchaudio speechbrain tensorboard soundfile pandas tqdm\n",
+    "\n",
+    "from google.colab import drive\n",
+    "drive.mount('/content/drive')\n",
+    "\n",
+    "import os\n",
+    "WORK_DIR = '/content/drive/MyDrive/DeepVQE_Workspace'\n",
+    "os.makedirs(WORK_DIR, exist_ok=True)\n",
+    "os.chdir(WORK_DIR)\n",
+    "print(f\"Thư mục làm việc hiện tại: {os.getcwd()}\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 2. Clone mã nguồn DeepVQE"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": None,
+   "metadata": {},
+   "source": [
+    "# Thay đường dẫn URL bằng github repo của bạn (nếu có) hoặc copy thư mục lên Drive\n",
+    "GIT_REPO = \"https://github.com/hoxuanphu/Pdeepvqe.git\"\n",
+    "\n",
+    "if not os.path.exists(\"Pdeepvqe\"):\n",
+    "    !git clone {GIT_REPO}\n",
+    "else:\n",
+    "    print(\"Thư mục Pdeepvqe đã tồn tại.\")\n",
+    "\n",
+    "os.chdir(\"Pdeepvqe\")\n",
+    "print(f\"Đã vào thư mục mã nguồn: {os.getcwd()}\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 3. Tải bộ dữ liệu VoiceBank-DEMAND\n",
+    "Dữ liệu gốc được tải từ Đại học Edinburgh (chiếm khoảng 4GB - 5GB sau khi giải nén)."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": None,
+   "metadata": {},
+   "source": [
+    "import os\n",
+    "import zipfile\n",
+    "\n",
+    "data_dir = \"/content/drive/MyDrive/DeepVQE_Workspace/data/voicebank-demand\"\n",
+    "os.makedirs(data_dir, exist_ok=True)\n",
+    "\n",
+    "datasets = {\n",
+    "    \"clean_trainset_28spk_wav\": \"https://datashare.ed.ac.uk/bitstream/handle/10283/2791/clean_trainset_28spk_wav.zip\",\n",
+    "    \"noisy_trainset_28spk_wav\": \"https://datashare.ed.ac.uk/bitstream/handle/10283/2791/noisy_trainset_28spk_wav.zip\",\n",
+    "    \"clean_testset_wav\": \"https://datashare.ed.ac.uk/bitstream/handle/10283/2791/clean_testset_wav.zip\",\n",
+    "    \"noisy_testset_wav\": \"https://datashare.ed.ac.uk/bitstream/handle/10283/2791/noisy_testset_wav.zip\"\n",
+    "}\n",
+    "\n",
+    "for folder_name, url in datasets.items():\n",
+    "    extract_path = os.path.join(data_dir, folder_name)\n",
+    "    zip_path = os.path.join(data_dir, folder_name + \".zip\")\n",
+    "    \n",
+    "    # Kiểm tra xem thư mục giải nén đã có dữ liệu chưa\n",
+    "    if os.path.exists(extract_path) and len(os.listdir(extract_path)) > 0:\n",
+    "        print(f\"Thư mục {folder_name} đã tồn tại và có dữ liệu trong Drive, bỏ qua tải.\")\n",
+    "    else:\n",
+    "        if not os.path.exists(zip_path):\n",
+    "            print(f\"Đang tải {folder_name}.zip về Drive...\")\n",
+    "            !wget -nc -P {data_dir} {url}\n",
+    "        else:\n",
+    "            print(f\"File {folder_name}.zip đã tồn tại trong Drive, tiến hành giải nén.\")\n",
+    "        \n",
+    "        print(f\"Đang giải nén {folder_name}.zip...\")\n",
+    "        try:\n",
+    "            with zipfile.ZipFile(zip_path, 'r') as zip_ref:\n",
+    "                zip_ref.extractall(data_dir)\n",
+    "            # (Tùy chọn) Xóa file zip để tiết kiệm dung lượng Drive\n",
+    "            # os.remove(zip_path)\n",
+    "            print(f\"Đã giải nén xong {folder_name}.zip\")\n",
+    "        except zipfile.BadZipFile:\n",
+    "            print(f\"Lỗi: File {folder_name}.zip bị hỏng. Vui lòng xóa file này và chạy lại ô này.\")\n",
+    "\n",
+    "print(\"\\nKiểm tra và chuẩn bị dữ liệu VCTK-DEMAND hoàn tất!\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 4. Xử lý và phân chia Dataset (Tạo file CSV)\n",
+    "Để framework (ví dụ như SpeechBrain) dễ dàng tải dữ liệu, ta sẽ tạo các file metadata dạng CSV (`train.csv`, `valid.csv`, `test.csv`)."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": None,
+   "metadata": {},
+   "source": [
+    "import glob\n",
+    "import pandas as pd\n",
+    "\n",
+    "def create_csv(clean_dir, noisy_dir, output_csv):\n",
+    "    clean_files = sorted(glob.glob(os.path.join(clean_dir, \"*.wav\")))\n",
+    "    noisy_files = sorted(glob.glob(os.path.join(noisy_dir, \"*.wav\")))\n",
+    "    \n",
+    "    assert len(clean_files) == len(noisy_files), f\"Số lượng file không khớp! ({len(clean_files)} != {len(noisy_files)})\"\n",
+    "    \n",
+    "    data = []\n",
+    "    for c, n in zip(clean_files, noisy_files):\n",
+    "        filename = os.path.basename(c)\n",
+    "        data.append({\n",
+    "            \"ID\": filename.replace(\".wav\", \"\"),\n",
+    "            \"clean_wav\": os.path.abspath(c),\n",
+    "            \"noisy_wav\": os.path.abspath(n)\n",
+    "        })\n",
+    "        \n",
+    "    df = pd.DataFrame(data)\n",
+    "    df.to_csv(output_csv, index=False)\n",
+    "    print(f\"Đã tạo {output_csv} với {len(df)} mẫu.\")\n",
+    "\n",
+    "base_dir = data_dir\n",
+    "# Tạo file CSV thô\n",
+    "create_csv(f\"{base_dir}/clean_trainset_28spk_wav\", f\"{base_dir}/noisy_trainset_28spk_wav\", f\"{base_dir}/train_full.csv\")\n",
+    "create_csv(f\"{base_dir}/clean_testset_wav\", f\"{base_dir}/noisy_testset_wav\", f\"{base_dir}/test.csv\")\n",
+    "\n",
+    "# Tách train_full thành train (90%) và valid (10%)\n",
+    "df_train_full = pd.read_csv(f\"{base_dir}/train_full.csv\")\n",
+    "df_train_full = df_train_full.sample(frac=1, random_state=42).reset_index(drop=True)\n",
+    "\n",
+    "split_idx = int(len(df_train_full) * 0.90)\n",
+    "df_train_full.iloc[:split_idx].to_csv(f\"{base_dir}/train.csv\", index=False)\n",
+    "df_train_full.iloc[split_idx:].to_csv(f\"{base_dir}/valid.csv\", index=False)\n",
+    "\n",
+    "print(\"Hoàn tất tạo metadata (train.csv, valid.csv, test.csv)!\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 5. Cấu hình Train (hparams.yaml)\n",
+    "File cấu hình hyperparameters cho DeepVQE."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": None,
+   "metadata": {},
+   "source": [
+    "yaml_content = \"\"\"\n",
+    "seed: 1234\n",
+    "__set_seed: !apply:torch.manual_seed [!ref <seed>]\n",
+    "\n",
+    "# Data paths\n",
+    "data_folder: /content/drive/MyDrive/DeepVQE_Workspace/data/voicebank-demand\n",
+    "train_annotation: !ref <data_folder>/train.csv\n",
+    "valid_annotation: !ref <data_folder>/valid.csv\n",
+    "test_annotation: !ref <data_folder>/test.csv\n",
+    "\n",
+    "# Audio parameters\n",
+    "sample_rate: 16000\n",
+    "\n",
+    "# Training parameters\n",
+    "batch_size: 4 # Đã giảm xuống 4 để tránh tràn RAM GPU (OOM) trên Colab\n",
+    "N_epochs: 100\n",
+    "lr: 0.0002\n",
+    "\n",
+    "# Dataloaders\n",
+    "dataloader_options:\n",
+    "    batch_size: !ref <batch_size>\n",
+    "    num_workers: 2\n",
+    "    drop_last: False\n",
+    "\n",
+    "# Model Definition\n",
+    "# Đảm bảo bạn đã định nghĩa class DeepVQE trong file deepvqe.py (Mô hình gốc)\n",
+    "model: !new:deepvqe.DeepVQE\n",
+    "    # Các cấu hình của model gốc (chỉnh sửa theo đúng class của bạn)\n",
+    "    \n",
+    "# Optimizer\n",
+    "opt_class: !name:torch.optim.Adam\n",
+    "    lr: !ref <lr>\n",
+    "\n",
+    "epoch_counter: !new:speechbrain.utils.epoch_loop.EpochCounter\n",
+    "    limit: !ref <N_epochs>\n",
+    "\n",
+    "# Checkpointer để lưu lại mô hình trực tiếp lên Google Drive\n",
+    "output_folder: /content/drive/MyDrive/DeepVQE_Workspace/checkpoints/deepvqe_vctk/<seed>\n",
+    "save_folder: !ref <output_folder>/save\n",
+    "checkpointer: !new:speechbrain.utils.checkpoints.Checkpointer\n",
+    "    checkpoints_dir: !ref <save_folder>\n",
+    "    recoverables:\n",
+    "        model: !ref <model>\n",
+    "        optimizer: !ref <opt_class>\n",
+    "        counter: !ref <epoch_counter>\n",
+    "\"\"\"\n",
+    "\n",
+    "with open(\"hparams_vctk.yaml\", \"w\") as f:\n",
+    "    f.write(yaml_content)\n",
+    "print(\"Đã lưu cấu hình vào hparams_vctk.yaml\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 6. Code Train\n",
+    "Nếu bạn đã viết sẵn file `train.py`, bạn có thể gọi trực tiếp ở đây. Dưới đây là ví dụ gọi file training hoặc viết hàm train trực tiếp."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": None,
+   "metadata": {},
+   "source": [
+    "\"\"\"\n",
+    "# Nếu bạn đã có file train.py theo chuẩn SpeechBrain, chỉ cần chạy lệnh sau:\n",
+    "!python train.py hparams_vctk.yaml\n",
+    "\"\"\"\n",
+    "# Ví dụ code train nếu muốn train trực tiếp trong Notebook\n",
+    "import os\n",
+    "import sys\n",
+    "import torch\n",
+    "import torchaudio\n",
+    "from speechbrain.core import Brain\n",
+    "from speechbrain.dataio.dataset import DynamicItemDataset\n",
+    "from hyperpyyaml import load_hyperpyyaml\n",
+    "\n",
+    "# Đảm bảo đang đứng đúng thư mục chứa mã nguồn (trường hợp bạn bị disconnect và chạy thẳng ô này)\n",
+    "work_dir = '/content/drive/MyDrive/DeepVQE_Workspace/Pdeepvqe'\n",
+    "if os.path.exists(work_dir):\n",
+    "    os.chdir(work_dir)\n",
+    "    sys.path.append(work_dir)\n",
+    "\n",
+    "# Đọc cấu hình từ file YAML\n",
+    "with open('hparams_vctk.yaml') as fin:\n",
+    "    hparams = load_hyperpyyaml(fin)\n",
+    "\n",
+    "# 1. Chuẩn bị DataLoader (SpeechBrain DynamicItemDataset)\n",
+    "# Hàm đọc audio\n",
+    "def audio_pipeline(file_path):\n",
+    "    sig, sr = torchaudio.load(file_path)\n",
+    "    return sig.squeeze(0) # Chuyển [1, T] thành [T] để SpeechBrain tự động padding\n",
+    "\n",
+    "train_set = DynamicItemDataset.from_csv(hparams['train_annotation'])\n",
+    "valid_set = DynamicItemDataset.from_csv(hparams['valid_annotation'])\n",
+    "\n",
+    "train_set.add_dynamic_item(audio_pipeline, takes=\"noisy_wav\", provides=\"noisy_sig\")\n",
+    "train_set.add_dynamic_item(audio_pipeline, takes=\"clean_wav\", provides=\"clean_sig\")\n",
+    "train_set.set_output_keys([\"id\", \"noisy_sig\", \"clean_sig\"])\n",
+    "\n",
+    "valid_set.add_dynamic_item(audio_pipeline, takes=\"noisy_wav\", provides=\"noisy_sig\")\n",
+    "valid_set.add_dynamic_item(audio_pipeline, takes=\"clean_wav\", provides=\"clean_sig\")\n",
+    "valid_set.set_output_keys([\"id\", \"noisy_sig\", \"clean_sig\"])\n",
+    "\n",
+    "# 2. Định nghĩa Recipe Train (kế thừa từ speechbrain.Brain)\n",
+    "class VQE_Brain(Brain):\n",
+    "    def compute_forward(self, batch, stage):\n",
+    "        noisy_wavs, lens = batch.noisy_sig\n",
+    "        noisy_wavs = noisy_wavs.to(self.device) # Đảm bảo tensor nằm trên đúng GPU/CPU\n",
+    "        \n",
+    "        # 2.1 Tính STFT cho tín hiệu 16kHz (n_fft=512 -> 257 Freq bins)\n",
+    "        window = torch.hann_window(512).to(self.device)\n",
+    "        noisy_stft = torch.stft(noisy_wavs, n_fft=512, hop_length=256, win_length=512, \n",
+    "                                window=window, return_complex=True)\n",
+    "        noisy_stft = torch.view_as_real(noisy_stft) # (B, F, T, 2) tương thích với DeepVQE\n",
+    "        \n",
+    "        # 2.2 Đưa qua mô hình DeepVQE: Input/Output có shape (B, F, T, 2)\n",
+    "        pred_stft = self.modules.model(noisy_stft)\n",
+    "        \n",
+    "        # 2.3 Tính ISTFT để khôi phục lại Waveform\n",
+    "        pred_stft_complex = torch.complex(pred_stft[..., 0], pred_stft[..., 1])\n",
+    "        enhanced_wavs = torch.istft(pred_stft_complex, n_fft=512, hop_length=256, win_length=512,\n",
+    "                                    window=window, length=noisy_wavs.shape[1])\n",
+    "        \n",
+    "        return enhanced_wavs\n",
+    "\n",
+    "    def compute_objectives(self, predictions, batch, stage):\n",
+    "        clean_wavs, lens = batch.clean_sig\n",
+    "        clean_wavs = clean_wavs.to(self.device)\n",
+    "        \n",
+    "        # Loss L1 trên Waveform\n",
+    "        loss = torch.nn.functional.l1_loss(predictions, clean_wavs)\n",
+    "        return loss\n",
+    "\n",
+    "# 3. Khởi tạo và Train (tự động Resume từ checkpoint nếu có)\n",
+    "vqe_brain = VQE_Brain(\n",
+    "    modules={'model': hparams['model']},\n",
+    "    opt_class=hparams['opt_class'],\n",
+    "    hparams=hparams,\n",
+    "    checkpointer=hparams['checkpointer'], \n",
+    ")\n",
+    "\n",
+    "# Chạy Train Loop\n",
+    "vqe_brain.fit(\n",
+    "    vqe_brain.hparams.epoch_counter,\n",
+    "    train_set,\n",
+    "    valid_set,\n",
+    "    train_loader_kwargs=hparams['dataloader_options'],\n",
+    "    valid_loader_kwargs=hparams['dataloader_options'],\n",
+    ")\n",
+    "print(\"Môi trường và kịch bản đã sẵn sàng. Hãy chạy script train.py của bạn!\")"
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "name": "python",
+   "version": "3.8.10"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 4
+}
+
+with open(r"d:\AI20K\deepvqe\train_base_deepvqe_colab.ipynb", "w", encoding="utf-8") as f:
+    json.dump(nb, f, indent=1, ensure_ascii=False)
