@@ -1,0 +1,9 @@
+experiment:
+  config_id: B2
+  output_dir: runs/ablation/B2
+model:
+  prelu_type:
+  dw_residual: false
+  use_eca_f: true
+  main_block_eca_f: false
+  gru_hidden: 576
