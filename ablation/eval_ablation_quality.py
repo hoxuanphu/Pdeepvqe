@@ -12,6 +12,7 @@ if __package__ in (None, ""):
 import numpy as np
 import torch
 import torchaudio
+from torch import nn
 
 from ablation.ablation_config import get_train_config, reproducibility_metadata
 from ablation.deepvqe_ablation import DeepVQE_Ablation
@@ -54,13 +55,97 @@ def align_length(wav, length):
     return wav[:length]
 
 
+def torch_load_checkpoint(checkpoint_path, device):
+    try:
+        return torch.load(str(checkpoint_path), map_location=device, weights_only=False)
+    except TypeError:
+        return torch.load(str(checkpoint_path), map_location=device)
+
+
+def looks_like_state_dict(value):
+    return (
+        isinstance(value, dict)
+        and len(value) > 0
+        and all(torch.is_tensor(item) or isinstance(item, nn.Parameter) for item in value.values())
+    )
+
+
+def extract_state_dict(ckpt):
+    if isinstance(ckpt, nn.Module):
+        return ckpt.state_dict()
+    if looks_like_state_dict(ckpt):
+        return ckpt
+    if not isinstance(ckpt, dict):
+        raise TypeError(f"Unsupported checkpoint object: {type(ckpt).__name__}")
+
+    for key in ("model", "model_state_dict", "state_dict", "net", "network"):
+        value = ckpt.get(key)
+        if isinstance(value, nn.Module):
+            return value.state_dict()
+        if looks_like_state_dict(value):
+            return value
+
+    keys = sorted(str(key) for key in ckpt.keys())
+    raise KeyError(f"Checkpoint does not contain a model state_dict. Available keys: {keys[:20]}")
+
+
+def state_dict_variants(state_dict):
+    yield "original", state_dict
+    prefixes = ("module.", "model.", "mods.model.", "module.model.", "hparams.model.")
+    for prefix in prefixes:
+        if any(key.startswith(prefix) for key in state_dict):
+            stripped = {
+                key[len(prefix):] if key.startswith(prefix) else key: value
+                for key, value in state_dict.items()
+            }
+            yield f"strip {prefix!r}", stripped
+
+
+def load_state_dict_flexible(model, state_dict):
+    target_keys = set(model.state_dict())
+    failures = []
+    best = None
+
+    for label, candidate in state_dict_variants(state_dict):
+        candidate_keys = set(candidate)
+        overlap = len(target_keys & candidate_keys)
+        if best is None or overlap > best[0]:
+            best = (overlap, label, candidate)
+        try:
+            model.load_state_dict(candidate, strict=True)
+            return [f"loaded checkpoint with {label} keys"]
+        except RuntimeError as exc:
+            failures.append(f"{label}: {exc}")
+
+    if best is not None and best[0] > 0:
+        _, label, candidate = best
+        missing, unexpected = model.load_state_dict(candidate, strict=False)
+        if not missing:
+            note = f"loaded checkpoint with {label} keys; ignored {len(unexpected)} unexpected keys"
+            return [note]
+        failures.append(
+            f"best partial match {label}: missing={list(missing)[:10]}, unexpected={list(unexpected)[:10]}"
+        )
+
+    checkpoint_keys = sorted(str(key) for key in state_dict.keys())[:20]
+    model_keys = sorted(str(key) for key in model.state_dict().keys())[:20]
+    detail = "\n".join(failures[-3:])
+    raise RuntimeError(
+        "Unable to load checkpoint into DeepVQE_Ablation.\n"
+        f"Checkpoint key sample: {checkpoint_keys}\n"
+        f"Model key sample: {model_keys}\n"
+        f"Recent load errors:\n{detail}"
+    )
+
+
 def load_checkpoint_model(checkpoint_path, config_id, device):
-    ckpt = torch.load(str(checkpoint_path), map_location=device)
-    cfg = ckpt.get("config", get_train_config(config_id))
+    ckpt = torch_load_checkpoint(checkpoint_path, "cpu")
+    cfg = ckpt.get("config", get_train_config(config_id)) if isinstance(ckpt, dict) else get_train_config(config_id)
     model_cfg = cfg.get("model", get_train_config(config_id)["model"])
     model = DeepVQE_Ablation(**model_cfg).to(device).eval()
-    model.load_state_dict(ckpt["model"])
-    return model, cfg, ckpt.get("metadata", {})
+    load_notes = load_state_dict_flexible(model, extract_state_dict(ckpt))
+    metadata = ckpt.get("metadata", {}) if isinstance(ckpt, dict) else {}
+    return model, cfg, metadata, load_notes
 
 
 @torch.no_grad()
@@ -83,7 +168,7 @@ def main():
     args = parser.parse_args()
 
     device = torch.device(args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu")
-    model, cfg, ckpt_metadata = load_checkpoint_model(args.checkpoint, args.config_id, device)
+    model, cfg, ckpt_metadata, load_notes = load_checkpoint_model(args.checkpoint, args.config_id, device)
     manifest = args.manifest or cfg["data"].get("test_manifest") or cfg["data"].get("valid_manifest")
     records = read_json_manifest(manifest)
     sample_rate = int(cfg["data"]["sample_rate"])
@@ -91,7 +176,7 @@ def main():
     metric_modules = optional_metric_modules()
 
     values = {"si_sdr": [], "pesq": [], "stoi": []}
-    notes = []
+    notes = list(load_notes)
     if metric_modules["pesq"] is None:
         notes.append("pesq package not installed")
     if metric_modules["stoi"] is None:
