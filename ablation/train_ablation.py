@@ -229,7 +229,7 @@ def unwrap_model(model):
     return model.module if isinstance(model, torch.nn.DataParallel) else model
 
 
-def save_checkpoint(path, model, optimizer, scheduler, cfg, epoch, best_metric):
+def save_checkpoint(path, model, optimizer, scheduler, cfg, epoch, best_metric, bad_epochs=0):
     path.parent.mkdir(parents=True, exist_ok=True)
     metadata = reproducibility_metadata(cfg, checkpoint_id=path.stem)
     torch.save(
@@ -241,6 +241,7 @@ def save_checkpoint(path, model, optimizer, scheduler, cfg, epoch, best_metric):
             "metadata": metadata,
             "epoch": epoch,
             "best_metric": best_metric,
+            "bad_epochs": bad_epochs,
         },
         str(path),
     )
@@ -265,7 +266,7 @@ def load_checkpoint(path, model, optimizer=None, scheduler=None, device="cpu"):
         optimizer.load_state_dict(ckpt["optimizer"])
     if scheduler is not None and ckpt.get("scheduler") is not None:
         scheduler.load_state_dict(ckpt["scheduler"])
-    return int(ckpt.get("epoch", 0)), ckpt.get("best_metric")
+    return int(ckpt.get("epoch", 0)), ckpt.get("best_metric"), int(ckpt.get("bad_epochs", 0))
 
 
 def make_model(cfg, device, data_parallel=False):
@@ -335,6 +336,9 @@ def main():
     parser.add_argument("--resume", default=None)
     parser.add_argument("--data-parallel", action="store_true", help="Use torch.nn.DataParallel when multiple CUDA GPUs are available")
     parser.add_argument("--ignore-bad-resume", action="store_true", help="Start from scratch if the resume checkpoint cannot be loaded")
+    parser.add_argument("--early-stop-patience", type=int, default=None, help="Stop if the monitored validation metric does not improve for this many epochs")
+    parser.add_argument("--early-stop-min-delta", type=float, default=0.0, help="Minimum monitored metric improvement required to reset early-stop patience")
+    parser.add_argument("--early-stop-min-epochs", type=int, default=0, help="Do not early-stop before this epoch")
     args = parser.parse_args()
 
     cfg = get_train_config(args.config_id)
@@ -364,6 +368,10 @@ def main():
     if args.resume:
         cfg["experiment"]["resume_from"] = args.resume
     cfg["training"]["data_parallel"] = bool(args.data_parallel)
+    if args.early_stop_patience is not None:
+        cfg["training"]["early_stop_patience"] = args.early_stop_patience
+    cfg["training"]["early_stop_min_delta"] = float(args.early_stop_min_delta)
+    cfg["training"]["early_stop_min_epochs"] = int(args.early_stop_min_epochs)
 
     seed_everything(int(cfg["experiment"]["seed"]))
     requested_device = cfg["training"]["device"]
@@ -381,10 +389,15 @@ def main():
 
     start_epoch = 0
     best_metric = None
+    bad_epochs = 0
     if cfg["experiment"].get("resume_from"):
         try:
-            start_epoch, best_metric = load_checkpoint(cfg["experiment"]["resume_from"], model, optimizer, scheduler, device)
-            print(f"Resumed from {cfg['experiment']['resume_from']} at epoch={start_epoch}", flush=True)
+            start_epoch, best_metric, bad_epochs = load_checkpoint(cfg["experiment"]["resume_from"], model, optimizer, scheduler, device)
+            print(
+                f"Resumed from {cfg['experiment']['resume_from']} at epoch={start_epoch} "
+                f"best_metric={best_metric} bad_epochs={bad_epochs}",
+                flush=True,
+            )
         except Exception as exc:
             if not args.ignore_bad_resume:
                 raise
@@ -396,9 +409,15 @@ def main():
             cfg["experiment"]["resume_from"] = None
             model = make_model(cfg, device, data_parallel=args.data_parallel)
             optimizer, scheduler = make_optimizer_scheduler(model, cfg)
+            start_epoch = 0
+            best_metric = None
+            bad_epochs = 0
 
     monitor = cfg["training"]["checkpoint_monitor"]
     mode = cfg["training"]["checkpoint_mode"]
+    early_stop_patience = cfg["training"].get("early_stop_patience")
+    early_stop_min_delta = float(cfg["training"].get("early_stop_min_delta", 0.0))
+    early_stop_min_epochs = int(cfg["training"].get("early_stop_min_epochs", 0))
     for epoch in range(start_epoch + 1, int(cfg["training"]["epochs"]) + 1):
         start = time.time()
         train_metrics = run_epoch(model, train_loader, cfg, window, device, optimizer)
@@ -406,17 +425,36 @@ def main():
             valid_metrics = run_epoch(model, valid_loader, cfg, window, device)
         monitor_value = valid_metrics.get(monitor, -valid_metrics["loss"])
         scheduler.step(monitor_value)
-        is_best = best_metric is None or (monitor_value > best_metric if mode == "max" else monitor_value < best_metric)
+        previous_best = best_metric
+        if mode == "max":
+            is_best = previous_best is None or monitor_value > previous_best
+            improved_enough = previous_best is None or monitor_value > previous_best + early_stop_min_delta
+        else:
+            is_best = previous_best is None or monitor_value < previous_best
+            improved_enough = previous_best is None or monitor_value < previous_best - early_stop_min_delta
         if is_best:
             best_metric = monitor_value
-        save_checkpoint(output_dir / "last.pt", model, optimizer, scheduler, cfg, epoch, best_metric)
+        if improved_enough:
+            bad_epochs = 0
+        else:
+            bad_epochs += 1
+        save_checkpoint(output_dir / "last.pt", model, optimizer, scheduler, cfg, epoch, best_metric, bad_epochs)
         if is_best:
-            save_checkpoint(output_dir / "best.pt", model, optimizer, scheduler, cfg, epoch, best_metric)
+            save_checkpoint(output_dir / "best.pt", model, optimizer, scheduler, cfg, epoch, best_metric, bad_epochs)
         print(
             f"epoch={epoch} time={time.time() - start:.1f}s "
-            f"train={train_metrics} valid={valid_metrics} best_{monitor}={best_metric}",
+            f"train={train_metrics} valid={valid_metrics} best_{monitor}={best_metric} "
+            f"bad_epochs={bad_epochs}",
             flush=True,
         )
+        if early_stop_patience is not None and epoch >= early_stop_min_epochs and bad_epochs >= early_stop_patience:
+            print(
+                f"Early stopping {args.config_id}: {monitor} did not improve by "
+                f"{early_stop_min_delta} for {bad_epochs} epochs "
+                f"(patience={early_stop_patience}, best_{monitor}={best_metric}).",
+                flush=True,
+            )
+            break
 
 
 if __name__ == "__main__":
