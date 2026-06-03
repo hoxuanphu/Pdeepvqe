@@ -247,7 +247,10 @@ def save_checkpoint(path, model, optimizer, scheduler, cfg, epoch, best_metric):
 
 
 def load_checkpoint(path, model, optimizer=None, scheduler=None, device="cpu"):
-    ckpt = torch.load(str(path), map_location=device)
+    try:
+        ckpt = torch.load(str(path), map_location=device, weights_only=False)
+    except TypeError:
+        ckpt = torch.load(str(path), map_location=device)
     state = ckpt["model"]
     target = unwrap_model(model)
     try:
