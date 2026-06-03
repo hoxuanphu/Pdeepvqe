@@ -265,6 +265,34 @@ def load_checkpoint(path, model, optimizer=None, scheduler=None, device="cpu"):
     return int(ckpt.get("epoch", 0)), ckpt.get("best_metric")
 
 
+def make_model(cfg, device, data_parallel=False):
+    model = DeepVQE_Ablation(**cfg["model"]).to(device)
+    if data_parallel:
+        if device.type != "cuda" or torch.cuda.device_count() < 2:
+            print("--data-parallel requested, but fewer than 2 CUDA GPUs are available; using single-device training.", flush=True)
+        else:
+            print(f"Using DataParallel on {torch.cuda.device_count()} CUDA GPUs", flush=True)
+            model = torch.nn.DataParallel(model)
+    return model
+
+
+def make_optimizer_scheduler(model, cfg):
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=float(cfg["optimizer"]["lr"]),
+        weight_decay=float(cfg["optimizer"]["weight_decay"]),
+        betas=tuple(cfg["optimizer"]["betas"]),
+    )
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode=cfg["scheduler"]["mode"],
+        factor=float(cfg["scheduler"]["factor"]),
+        patience=int(cfg["scheduler"]["patience"]),
+        min_lr=float(cfg["scheduler"]["min_lr"]),
+    )
+    return optimizer, scheduler
+
+
 def run_epoch(model, loader, cfg, window, device, optimizer=None):
     train = optimizer is not None
     model.train(train)
@@ -303,6 +331,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--resume", default=None)
     parser.add_argument("--data-parallel", action="store_true", help="Use torch.nn.DataParallel when multiple CUDA GPUs are available")
+    parser.add_argument("--ignore-bad-resume", action="store_true", help="Start from scratch if the resume checkpoint cannot be loaded")
     args = parser.parse_args()
 
     cfg = get_train_config(args.config_id)
@@ -343,32 +372,27 @@ def main():
 
     train_loader = make_loader(cfg["data"]["train_manifest"], cfg, "train", args.data_root)
     valid_loader = make_loader(cfg["data"]["valid_manifest"], cfg, "valid", args.data_root)
-    model = DeepVQE_Ablation(**cfg["model"]).to(device)
-    if args.data_parallel:
-        if device.type != "cuda" or torch.cuda.device_count() < 2:
-            print("--data-parallel requested, but fewer than 2 CUDA GPUs are available; using single-device training.", flush=True)
-        else:
-            print(f"Using DataParallel on {torch.cuda.device_count()} CUDA GPUs", flush=True)
-            model = torch.nn.DataParallel(model)
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=float(cfg["optimizer"]["lr"]),
-        weight_decay=float(cfg["optimizer"]["weight_decay"]),
-        betas=tuple(cfg["optimizer"]["betas"]),
-    )
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode=cfg["scheduler"]["mode"],
-        factor=float(cfg["scheduler"]["factor"]),
-        patience=int(cfg["scheduler"]["patience"]),
-        min_lr=float(cfg["scheduler"]["min_lr"]),
-    )
+    model = make_model(cfg, device, data_parallel=args.data_parallel)
+    optimizer, scheduler = make_optimizer_scheduler(model, cfg)
     window = torch.hann_window(int(cfg["stft"]["win_length"]), device=device)
 
     start_epoch = 0
     best_metric = None
     if cfg["experiment"].get("resume_from"):
-        start_epoch, best_metric = load_checkpoint(cfg["experiment"]["resume_from"], model, optimizer, scheduler, device)
+        try:
+            start_epoch, best_metric = load_checkpoint(cfg["experiment"]["resume_from"], model, optimizer, scheduler, device)
+            print(f"Resumed from {cfg['experiment']['resume_from']} at epoch={start_epoch}", flush=True)
+        except Exception as exc:
+            if not args.ignore_bad_resume:
+                raise
+            print(
+                f"WARNING: unable to resume from {cfg['experiment']['resume_from']}; "
+                f"starting {args.config_id} from scratch. Error: {exc}",
+                flush=True,
+            )
+            cfg["experiment"]["resume_from"] = None
+            model = make_model(cfg, device, data_parallel=args.data_parallel)
+            optimizer, scheduler = make_optimizer_scheduler(model, cfg)
 
     monitor = cfg["training"]["checkpoint_monitor"]
     mode = cfg["training"]["checkpoint_mode"]
