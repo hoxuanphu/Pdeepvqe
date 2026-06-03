@@ -225,12 +225,16 @@ def make_loader(manifest, cfg, split, data_root):
     )
 
 
+def unwrap_model(model):
+    return model.module if isinstance(model, torch.nn.DataParallel) else model
+
+
 def save_checkpoint(path, model, optimizer, scheduler, cfg, epoch, best_metric):
     path.parent.mkdir(parents=True, exist_ok=True)
     metadata = reproducibility_metadata(cfg, checkpoint_id=path.stem)
     torch.save(
         {
-            "model": model.state_dict(),
+            "model": unwrap_model(model).state_dict(),
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict() if scheduler is not None else None,
             "config": cfg,
@@ -244,7 +248,16 @@ def save_checkpoint(path, model, optimizer, scheduler, cfg, epoch, best_metric):
 
 def load_checkpoint(path, model, optimizer=None, scheduler=None, device="cpu"):
     ckpt = torch.load(str(path), map_location=device)
-    model.load_state_dict(ckpt["model"])
+    state = ckpt["model"]
+    target = unwrap_model(model)
+    try:
+        target.load_state_dict(state)
+    except RuntimeError:
+        if all(key.startswith("module.") for key in state):
+            state = {key.replace("module.", "", 1): value for key, value in state.items()}
+            target.load_state_dict(state)
+        else:
+            raise
     if optimizer is not None and ckpt.get("optimizer") is not None:
         optimizer.load_state_dict(ckpt["optimizer"])
     if scheduler is not None and ckpt.get("scheduler") is not None:
@@ -289,6 +302,7 @@ def main():
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--resume", default=None)
+    parser.add_argument("--data-parallel", action="store_true", help="Use torch.nn.DataParallel when multiple CUDA GPUs are available")
     args = parser.parse_args()
 
     cfg = get_train_config(args.config_id)
@@ -317,6 +331,7 @@ def main():
         cfg["training"]["batch_size"] = args.batch_size
     if args.resume:
         cfg["experiment"]["resume_from"] = args.resume
+    cfg["training"]["data_parallel"] = bool(args.data_parallel)
 
     seed_everything(int(cfg["experiment"]["seed"]))
     requested_device = cfg["training"]["device"]
@@ -329,6 +344,12 @@ def main():
     train_loader = make_loader(cfg["data"]["train_manifest"], cfg, "train", args.data_root)
     valid_loader = make_loader(cfg["data"]["valid_manifest"], cfg, "valid", args.data_root)
     model = DeepVQE_Ablation(**cfg["model"]).to(device)
+    if args.data_parallel:
+        if device.type != "cuda" or torch.cuda.device_count() < 2:
+            print("--data-parallel requested, but fewer than 2 CUDA GPUs are available; using single-device training.", flush=True)
+        else:
+            print(f"Using DataParallel on {torch.cuda.device_count()} CUDA GPUs", flush=True)
+            model = torch.nn.DataParallel(model)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=float(cfg["optimizer"]["lr"]),
