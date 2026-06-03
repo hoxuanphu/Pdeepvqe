@@ -5,6 +5,7 @@ Manifest records may use keys such as ``mixture``/``target`` or
 """
 
 import argparse
+import gc
 import json
 import random
 import sys
@@ -318,6 +319,8 @@ def run_epoch(model, loader, cfg, window, device, optimizer=None):
         values.append(item)
         if hasattr(iterator, "set_postfix"):
             iterator.set_postfix({key: f"{value:.4g}" for key, value in item.items()})
+        del batch, loss, metrics, item
+    gc.collect()
     return average(values)
 
 
@@ -333,6 +336,8 @@ def main():
     parser.add_argument("--device", default=None)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--num-workers", type=int, default=None, help="Override DataLoader workers")
+    parser.add_argument("--no-pin-memory", action="store_true", help="Disable DataLoader pinned-memory buffers")
     parser.add_argument("--resume", default=None)
     parser.add_argument("--data-parallel", action="store_true", help="Use torch.nn.DataParallel when multiple CUDA GPUs are available")
     parser.add_argument("--ignore-bad-resume", action="store_true", help="Start from scratch if the resume checkpoint cannot be loaded")
@@ -365,6 +370,10 @@ def main():
         cfg["training"]["epochs"] = args.epochs
     if args.batch_size is not None:
         cfg["training"]["batch_size"] = args.batch_size
+    if args.num_workers is not None:
+        cfg["data"]["num_workers"] = args.num_workers
+    if args.no_pin_memory:
+        cfg["data"]["pin_memory"] = False
     if args.resume:
         cfg["experiment"]["resume_from"] = args.resume
     cfg["training"]["data_parallel"] = bool(args.data_parallel)
