@@ -61,7 +61,7 @@ def main():
     # Load weights if checkpoint is provided
     if args.checkpoint:
         print(f"Loading weights from {args.checkpoint}...")
-        state_dict = torch.load(args.checkpoint, map_location=device)
+        state_dict = torch.load(args.checkpoint, map_location=device, weights_only=False)
         if "model_state_dict" in state_dict:
             state_dict = state_dict["model_state_dict"]
         # Cho phép strict=False vì có thể có các biến thể thay đổi cấu trúc nhẹ so với config
