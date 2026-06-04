@@ -83,6 +83,35 @@ def stateful_streaming_rtf(stream_model, frames, freq_bins, sample_rate, hop_len
     return elapsed / audio_seconds, elapsed
 
 
+@torch.no_grad()
+def stateful_streaming_rtf_per_frame(stream_model, frames, freq_bins, sample_rate, hop_length, warmup, repeats, device):
+    x = torch.randn(1, freq_bins, frames, 2, device=device)
+    for _ in range(warmup):
+        stream_sequence(stream_model, x)
+        
+    total_processing_time = 0.0
+    for _ in range(repeats):
+        cache = stream_model.init_cache(x.shape[0], x.shape[1], x.device, x.dtype)
+        for frame_idx in range(frames):
+            frame_input = x[:, :, frame_idx : frame_idx + 1, :]
+            
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            
+            y, cache = stream_model(frame_input, cache)
+            
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            t1 = time.perf_counter()
+            
+            total_processing_time += (t1 - t0)
+
+    elapsed = total_processing_time / max(1, repeats)
+    audio_seconds = frames * hop_length / sample_rate
+    return elapsed / audio_seconds, elapsed
+
+
 def passes_budget(row, max_params, max_macs, max_rtf, max_causality_error):
     if row["causality_error"] > max_causality_error:
         return False
@@ -141,6 +170,16 @@ def main():
             args.repeats,
             device,
         )
+        rtf_per_frame, mean_forward_seconds_per_frame = stateful_streaming_rtf_per_frame(
+            stream_model,
+            args.frames,
+            args.freq_bins,
+            args.sample_rate,
+            args.hop_length,
+            args.warmup,
+            args.repeats,
+            device,
+        )
 
         row = {
             "config_id": config_id,
@@ -150,6 +189,8 @@ def main():
             "flops": (2 * macs) if macs is not None else "",
             "streaming_rtf": rtf,
             "mean_streaming_ms": mean_forward_seconds * 1000.0,
+            "streaming_rtf_per_frame": rtf_per_frame,
+            "mean_streaming_ms_per_frame": mean_forward_seconds_per_frame * 1000.0,
             "streaming_parity_error": stream_error,
             "causality_error": c_error,
             "pass": False,
@@ -163,7 +204,7 @@ def main():
         rows.append(row)
         print(
             f"{config_id}: params={params} macs={row['macs']} "
-            f"stateful_rtf={rtf:.4f} stream_error={stream_error:.6g} "
+            f"stateful_rtf={rtf:.4f} rtf_per_frame={rtf_per_frame:.4f} stream_error={stream_error:.6g} "
             f"causality_error={c_error:.6g} pass={row['pass']}"
         )
 
@@ -183,6 +224,8 @@ def main():
         "flops",
         "streaming_rtf",
         "mean_streaming_ms",
+        "streaming_rtf_per_frame",
+        "mean_streaming_ms_per_frame",
         "streaming_parity_error",
         "causality_error",
         "pass",
