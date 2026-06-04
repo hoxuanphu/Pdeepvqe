@@ -37,6 +37,15 @@ def main():
     # Convert to mono if needed
     if wav.shape[0] > 1:
         wav = wav.mean(dim=0, keepdim=True)
+        
+    # Resample to 16kHz if necessary
+    target_sr = 16000
+    if sr != target_sr:
+        print(f"Resampling audio from {sr}Hz to {target_sr}Hz...")
+        resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=target_sr)
+        wav = resampler(wav)
+        sr = target_sr
+        
     wav = wav.to(device)
 
     # 2. STFT (Tạo features giống hệt cách FE xử lý trong DeepVQE)
