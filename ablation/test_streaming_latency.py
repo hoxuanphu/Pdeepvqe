@@ -21,6 +21,7 @@ def main():
     parser = argparse.ArgumentParser(description="Test streaming latency frame by frame on a real audio file.")
     parser.add_argument("--input", type=str, required=True, help="Path to input audio file (.wav)")
     parser.add_argument("--config", type=str, default="Baseline", help="Ablation config ID (e.g., Baseline, C1)")
+    parser.add_argument("--checkpoint", type=str, default=None, help="Path to the saved model checkpoint (.pt or .pth)")
     parser.add_argument("--output", type=str, default="streaming_metrics.csv", help="CSV output path for per-frame metrics")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--n-fft", type=int, default=512)
@@ -56,6 +57,16 @@ def main():
     # 3. Load Model & Convert to Streaming
     print(f"Loading {args.config} model...")
     offline_model = DeepVQE_Ablation.from_config_id(args.config).eval().to(device)
+    
+    # Load weights if checkpoint is provided
+    if args.checkpoint:
+        print(f"Loading weights from {args.checkpoint}...")
+        state_dict = torch.load(args.checkpoint, map_location=device)
+        if "model_state_dict" in state_dict:
+            state_dict = state_dict["model_state_dict"]
+        # Cho phép strict=False vì có thể có các biến thể thay đổi cấu trúc nhẹ so với config
+        offline_model.load_state_dict(state_dict, strict=False)
+
     stream_model = StreamDeepVQE_Ablation.from_config_id(args.config).eval().to(device)
     convert_ablation_to_stream(stream_model, offline_model, strict=True)
 
