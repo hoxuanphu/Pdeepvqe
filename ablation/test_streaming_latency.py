@@ -97,6 +97,7 @@ def main():
     
     frame_metrics = []
     total_processing_time = 0.0
+    out_frames = []
 
     with torch.no_grad():
         cache = stream_model.init_cache(1, spec.shape[1], device, spec.dtype)
@@ -111,6 +112,7 @@ def main():
             
             # Xử lý 1 frame
             y, cache = stream_model(frame_input, cache)
+            out_frames.append(y.cpu() if device.type == "cuda" else y)
             
             if device.type == "cuda":
                 torch.cuda.synchronize()
@@ -141,6 +143,25 @@ def main():
         writer = csv.DictWriter(f, fieldnames=["frame_idx", "start_time", "end_time", "processing_time_ms"])
         writer.writeheader()
         writer.writerows(frame_metrics)
+
+    # 6.5. Save Enhanced Audio
+    try:
+        pred_spec = torch.cat(out_frames, dim=2).to(device)  # Shape: (1, F, T, 2)
+        complex_spec = torch.complex(pred_spec[..., 0], pred_spec[..., 1])
+        enhanced_wav = torch.istft(
+            complex_spec,
+            n_fft=args.n_fft,
+            hop_length=args.hop_length,
+            win_length=args.win_length,
+            window=window,
+            length=wav.shape[-1]
+        )
+        
+        out_wav_path = output_path.with_name(output_path.stem + "_enhanced.wav")
+        torchaudio.save(str(out_wav_path), enhanced_wav.cpu(), sr)
+        print(f"Saved enhanced audio to: {out_wav_path}")
+    except Exception as e:
+        print(f"Failed to save enhanced audio: {e}")
 
     # 7. Print Summary
     print("\n" + "="*40)
