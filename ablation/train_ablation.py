@@ -333,7 +333,7 @@ def run_epoch(model, loader, cfg, window, device, optimizer=None, scaler=None):
     model.train(train)
     values = []
     iterator = loader
-    if tqdm is not None:
+    if tqdm is not None and not cfg["training"].get("disable_tqdm", False):
         iterator = tqdm(loader, desc="train" if train else "valid", dynamic_ncols=True, leave=False, ascii=True)
     for batch in iterator:
         if train:
@@ -383,6 +383,7 @@ def main():
     parser.add_argument("--early-stop-patience", type=int, default=None, help="Stop if the monitored validation metric does not improve for this many epochs")
     parser.add_argument("--early-stop-min-delta", type=float, default=0.0, help="Minimum monitored metric improvement required to reset early-stop patience")
     parser.add_argument("--early-stop-min-epochs", type=int, default=0, help="Do not early-stop before this epoch")
+    parser.add_argument("--disable-tqdm", action="store_true", help="Disable tqdm progress bars")
     args = parser.parse_args()
 
     cfg = get_train_config(args.config_id)
@@ -420,6 +421,7 @@ def main():
         cfg["training"]["early_stop_patience"] = args.early_stop_patience
     cfg["training"]["early_stop_min_delta"] = float(args.early_stop_min_delta)
     cfg["training"]["early_stop_min_epochs"] = int(args.early_stop_min_epochs)
+    cfg["training"]["disable_tqdm"] = bool(args.disable_tqdm)
 
     seed_everything(int(cfg["experiment"]["seed"]))
     requested_device = cfg["training"]["device"]
@@ -440,6 +442,29 @@ def main():
 
     use_amp = bool(cfg["training"].get("use_amp", False)) and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+
+    print(f"\n========================================", flush=True)
+    print(f"Device: {device}", flush=True)
+    if torch.cuda.is_available():
+        print(f"GPU count: {torch.cuda.device_count()}", flush=True)
+        for i in range(torch.cuda.device_count()):
+            print(f"  GPU {i}: {torch.cuda.get_device_name(i)}", flush=True)
+            
+    total_params = sum(p.numel() for p in unwrap_model(model).parameters())
+    trainable_params = sum(p.numel() for p in unwrap_model(model).parameters() if p.requires_grad)
+    print(f"Total params: {total_params / 1e6:.2f}M | Trainable: {trainable_params / 1e6:.2f}M", flush=True)
+    print(f"Mixed Precision (AMP): {'ON' if use_amp else 'OFF'}", flush=True)
+    
+    aug_cfg = cfg["data"].get("augment", False)
+    if aug_cfg:
+        aug_prob = cfg["data"].get("aug_prob", 0.5)
+        print(f"Augmentation: ON (prob={aug_prob})", flush=True)
+    else:
+        print("Augmentation: OFF", flush=True)
+        
+    print(f"Train: {len(train_loader.dataset)} samples, {len(train_loader)} batches", flush=True)
+    print(f"Valid: {len(valid_loader.dataset)} samples, {len(valid_loader)} batches", flush=True)
+    print(f"========================================\n", flush=True)
 
     start_epoch = 0
     best_metric = None
