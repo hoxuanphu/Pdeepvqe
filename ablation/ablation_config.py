@@ -43,7 +43,7 @@ BASE_TRAIN_CONFIG = {
         "aug_prob": 0.5,
     },
     "optimizer": {
-        "lr": 1e-3,
+        "lr": 1.25e-4,
         "weight_decay": 0.0,
         "betas": [0.9, 0.999],
         "grad_clip_norm": 5.0,
