@@ -4,6 +4,7 @@ import argparse
 import csv
 import json
 import sys
+from copy import deepcopy
 from pathlib import Path
 
 if __package__ in (None, ""):
@@ -53,6 +54,47 @@ def align_length(wav, length):
     if wav.numel() < length:
         return repeat_to_length(wav, length)
     return wav[:length]
+
+
+def load_sidecar_config(checkpoint_path):
+    config_path = Path(checkpoint_path).parent / "config.json"
+    if not config_path.exists():
+        return None, None
+    with config_path.open("r", encoding="utf-8") as f:
+        return json.load(f), config_path
+
+
+def apply_notebook_config(cfg, flat_cfg):
+    cfg = deepcopy(cfg)
+    stft = cfg.setdefault("stft", {})
+    data = cfg.setdefault("data", {})
+    experiment = cfg.setdefault("experiment", {})
+
+    for source_key, target_key in (
+        ("n_fft", "n_fft"),
+        ("hop_length", "hop_length"),
+        ("win_length", "win_length"),
+    ):
+        if source_key in flat_cfg:
+            stft[target_key] = flat_cfg[source_key]
+    if "stft_window" in flat_cfg:
+        stft["window"] = flat_cfg["stft_window"]
+    if "sample_rate" in flat_cfg:
+        data["sample_rate"] = flat_cfg["sample_rate"]
+    if "seed" in flat_cfg:
+        experiment["seed"] = flat_cfg["seed"]
+    return cfg
+
+
+def make_window(cfg, device):
+    stft_cfg = cfg["stft"]
+    name = str(stft_cfg.get("window", "hann")).lower().replace("-", "_")
+    window = torch.hann_window(int(stft_cfg["win_length"]), device=device)
+    if name in ("hann", "hanning"):
+        return window
+    if name in ("sqrt_hann", "sqrt_hanning"):
+        return window.sqrt()
+    raise ValueError(f"Unsupported STFT window: {stft_cfg.get('window')!r}")
 
 
 def torch_load_checkpoint(checkpoint_path, device):
@@ -141,9 +183,15 @@ def load_state_dict_flexible(model, state_dict):
 def load_checkpoint_model(checkpoint_path, config_id, device):
     ckpt = torch_load_checkpoint(checkpoint_path, "cpu")
     cfg = ckpt.get("config", get_train_config(config_id)) if isinstance(ckpt, dict) else get_train_config(config_id)
+    config_notes = []
+    if not (isinstance(ckpt, dict) and "config" in ckpt):
+        sidecar_cfg, sidecar_path = load_sidecar_config(checkpoint_path)
+        if sidecar_cfg is not None:
+            cfg = apply_notebook_config(cfg, sidecar_cfg)
+            config_notes.append(f"loaded eval config from {sidecar_path.name}")
     model_cfg = cfg.get("model", get_train_config(config_id)["model"])
     model = DeepVQE_Ablation(**model_cfg).to(device).eval()
-    load_notes = load_state_dict_flexible(model, extract_state_dict(ckpt))
+    load_notes = config_notes + load_state_dict_flexible(model, extract_state_dict(ckpt))
     metadata = ckpt.get("metadata", {}) if isinstance(ckpt, dict) else {}
     return model, cfg, metadata, load_notes
 
@@ -172,11 +220,12 @@ def main():
     manifest = args.manifest or cfg["data"].get("test_manifest") or cfg["data"].get("valid_manifest")
     records = read_json_manifest(manifest)
     sample_rate = int(cfg["data"]["sample_rate"])
-    window = torch.hann_window(int(cfg["stft"]["win_length"]), device=device)
+    window = make_window(cfg, device)
     metric_modules = optional_metric_modules()
 
     values = {"si_sdr": [], "pesq": [], "stoi": []}
     notes = list(load_notes)
+    notes.append(f"STFT window={cfg['stft'].get('window', 'hann')}")
     if metric_modules["pesq"] is None:
         notes.append("pesq package not installed")
     if metric_modules["stoi"] is None:
@@ -184,8 +233,8 @@ def main():
     notes.append("DNSMOS and ERLE require external evaluators and are not computed by this script")
 
     for record in records:
-        mixture = load_audio(resolve_path(pick_path(record, ["mixture", "mixture_path", "mix", "mix_path", "noisy"]), record, args.data_root), sample_rate)
-        target = load_audio(resolve_path(pick_path(record, ["target", "target_path", "clean", "target_wav"]), record, args.data_root), sample_rate)
+        mixture = load_audio(resolve_path(pick_path(record, ["mixture", "mixture_path", "mix", "mix_path", "noisy", "noisy_wav"]), record, args.data_root), sample_rate)
+        target = load_audio(resolve_path(pick_path(record, ["target", "target_path", "clean", "target_wav", "clean_wav"]), record, args.data_root), sample_rate)
         length = min(mixture.numel(), target.numel())
         mixture = align_length(mixture, length)
         target = align_length(target, length)

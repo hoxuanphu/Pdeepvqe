@@ -124,9 +124,9 @@ def main():
             
             frame_metrics.append({
                 "frame_idx": frame_idx,
-                "start_time": t0,
-                "end_time": t1,
-                "processing_time_ms": proc_time_sec * 1000.0
+                "start_time": f"{t0:.6f}",
+                "end_time": f"{t1:.6f}",
+                "processing_time_ms": f"{proc_time_sec * 1000.0:.4f}"
             })
 
     if device.type == "cuda":
