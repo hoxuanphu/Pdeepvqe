@@ -333,33 +333,72 @@ def run_epoch(model, loader, cfg, window, device, optimizer=None, scaler=None, d
     model.train(train)
     values = []
     iterator = loader
+    
+    accum_steps = int(cfg["training"].get("grad_accum_steps", 1)) if train else 1
+    valid_accum_batches = 0
+    progress_every = int(cfg["training"].get("progress_update_every", 1))
+
     if tqdm is not None and not cfg["training"].get("disable_tqdm", False):
         iterator = tqdm(loader, desc=desc_str, dynamic_ncols=True, leave=False, ascii=True)
-    for batch in iterator:
-        if train:
-            optimizer.zero_grad(set_to_none=True)
+        
+    if train:
+        optimizer.zero_grad(set_to_none=True)
+        
+    for batch_idx, batch in enumerate(iterator):
         loss, metrics = compute_batch(model, batch, cfg, window, device)
+        
+        if not torch.isfinite(loss):
+            print(f"  [WARN] Skip batch {batch_idx}: non-finite loss", flush=True)
+            if train:
+                optimizer.zero_grad(set_to_none=True)
+            continue
+            
         if train:
+            loss = loss / accum_steps
             if scaler is not None:
                 scaler.scale(loss).backward()
-                grad_clip = cfg["optimizer"].get("grad_clip_norm")
-                if grad_clip:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), float(grad_clip))
-                scaler.step(optimizer)
-                scaler.update()
             else:
                 loss.backward()
+                
+            valid_accum_batches += 1
+            if valid_accum_batches % accum_steps == 0:
                 grad_clip = cfg["optimizer"].get("grad_clip_norm")
-                if grad_clip:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), float(grad_clip))
-                optimizer.step()
+                if scaler is not None:
+                    if grad_clip:
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), float(grad_clip))
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    if grad_clip:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), float(grad_clip))
+                    optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                
         item = {**metrics}
         values.append(item)
-        if hasattr(iterator, "set_postfix"):
+        if hasattr(iterator, "set_postfix") and (batch_idx % progress_every == 0 or batch_idx + 1 == len(loader)):
             iterator.set_postfix({key: f"{value:.4g}" for key, value in item.items()})
+            
         del batch, loss, metrics, item
+        
+    if train and valid_accum_batches % accum_steps != 0:
+        grad_clip = cfg["optimizer"].get("grad_clip_norm")
+        if scaler is not None:
+            if grad_clip:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), float(grad_clip))
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            if grad_clip:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), float(grad_clip))
+            optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        
     gc.collect()
+    if not values:
+        return {"loss": float('nan'), "ri_loss": float('nan'), "mag_loss": float('nan'), "sisnr": float('nan')}
     return average(values)
 
 
