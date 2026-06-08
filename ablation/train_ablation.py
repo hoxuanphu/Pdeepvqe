@@ -328,13 +328,13 @@ def make_optimizer_scheduler(model, cfg):
     return optimizer, scheduler
 
 
-def run_epoch(model, loader, cfg, window, device, optimizer=None, scaler=None):
+def run_epoch(model, loader, cfg, window, device, optimizer=None, scaler=None, desc_str=""):
     train = optimizer is not None
     model.train(train)
     values = []
     iterator = loader
     if tqdm is not None and not cfg["training"].get("disable_tqdm", False):
-        iterator = tqdm(loader, desc="train" if train else "valid", dynamic_ncols=True, leave=False, ascii=True)
+        iterator = tqdm(loader, desc=desc_str, dynamic_ncols=True, leave=False, ascii=True)
     for batch in iterator:
         if train:
             optimizer.zero_grad(set_to_none=True)
@@ -508,11 +508,19 @@ def main():
     early_stop_min_epochs = int(cfg["training"].get("early_stop_min_epochs", 0))
     for epoch in range(start_epoch + 1, int(cfg["training"]["epochs"]) + 1):
         start = time.time()
-        train_metrics = run_epoch(model, train_loader, cfg, window, device, optimizer, scaler)
+        epoch_str_train = f"Epoch {epoch:>2} [Train]"
+        epoch_str_valid = f"Epoch {epoch:>2} [Valid]"
+        train_metrics = run_epoch(model, train_loader, cfg, window, device, optimizer, scaler, desc_str=epoch_str_train)
         with torch.no_grad():
-            valid_metrics = run_epoch(model, valid_loader, cfg, window, device)
+            valid_metrics = run_epoch(model, valid_loader, cfg, window, device, desc_str=epoch_str_valid)
         monitor_value = valid_metrics.get(monitor, -valid_metrics["loss"])
+        
+        prev_lr = optimizer.param_groups[0]['lr']
         scheduler.step(monitor_value)
+        current_lr = optimizer.param_groups[0]['lr']
+        if current_lr < prev_lr:
+            print(f"  >>> Scheduler giảm LR: {prev_lr:.2e} -> {current_lr:.2e}", flush=True)
+            
         previous_best = best_metric
         if mode == "max":
             is_best = previous_best is None or monitor_value > previous_best
@@ -529,10 +537,14 @@ def main():
         save_checkpoint(output_dir / "last.pt", model, optimizer, scheduler, cfg, epoch, best_metric, bad_epochs, scaler=scaler)
         if is_best:
             save_checkpoint(output_dir / "best.pt", model, optimizer, scheduler, cfg, epoch, best_metric, bad_epochs, scaler=scaler)
+            print(f"  >>> Saved best model ({monitor}={best_metric:.6f})", flush=True)
+            
+        current_lr = optimizer.param_groups[0]['lr']
         print(
-            f"epoch={epoch} time={time.time() - start:.1f}s "
-            f"train={train_metrics} valid={valid_metrics} best_{monitor}={best_metric} "
-            f"bad_epochs={bad_epochs}",
+            f"Epoch {epoch:>3}/{cfg['training']['epochs']} | "
+            f"Train Loss: {train_metrics['loss']:.6f} (ri={train_metrics['ri_loss']:.4f}, mag={train_metrics['mag_loss']:.4f}, sisnr={train_metrics['sisnr']:.4f}) | "
+            f"Valid Loss: {valid_metrics['loss']:.6f} (ri={valid_metrics['ri_loss']:.4f}, mag={valid_metrics['mag_loss']:.4f}, sisnr={valid_metrics['sisnr']:.4f}) | "
+            f"LR: {current_lr:.2e} | Time: {int(time.time() - start)}s",
             flush=True,
         )
         if early_stop_patience is not None and epoch >= early_stop_min_epochs and bad_epochs >= early_stop_patience:
