@@ -170,40 +170,247 @@ def make_istft(spec, cfg, window, length):
         complex_spec,
         n_fft=int(stft_cfg["n_fft"]),
         hop_length=int(stft_cfg["hop_length"]),
+import time
+from pathlib import Path
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import numpy as np
+import torch
+import torchaudio
+from torch.utils.data import DataLoader, Dataset
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
+
+from ablation.ablation_config import deep_update, reproducibility_metadata, get_train_config
+from ablation.deepvqe_ablation import DeepVQE_Ablation
+
+
+PATH_KEYS = {
+    "mixture": ["mixture", "mixture_path", "mix", "mix_path", "noisy", "input", "noisy_wav"],
+    "target": ["target", "target_path", "clean", "target_reverb", "target_wav", "clean_wav"],
+}
+
+
+def seed_everything(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.manual_seed_all(seed)
+
+
+def read_json_manifest(path):
+    path = Path(path)
+    if path.suffix.lower() == ".json":
+        with path.open("r", encoding="utf-8") as f:
+            records = json.load(f)
+        if not isinstance(records, list):
+            raise ValueError(f"JSON manifest must contain a list: {path}")
+    elif path.suffix.lower() == ".csv":
+        import csv
+        with path.open("r", encoding="utf-8", newline='') as f:
+            reader = csv.DictReader(f)
+            records = list(reader)
+    else:
+        records = []
+        with path.open("r", encoding="utf-8") as f:
+            for line_no, line in enumerate(f, 1):
+                line = line.strip()
+                if line:
+                    try:
+                        records.append(json.loads(line))
+                    except json.JSONDecodeError as exc:
+                        raise ValueError(f"Invalid JSON at {path}:{line_no}") from exc
+    if not records:
+        raise ValueError(f"Manifest is empty: {path}")
+    for record in records:
+        record["_manifest_dir"] = str(path.parent)
+    return records
+
+
+def pick_key(record, group):
+    for key in PATH_KEYS[group]:
+        if record.get(key):
+            return record[key]
+    raise KeyError(f"Manifest item is missing one of {PATH_KEYS[group]}: {record}")
+
+
+def resolve_path(value, record, data_root=None):
+    path = Path(value)
+    if path.is_absolute():
+        return path
+    candidates = []
+    if data_root:
+        candidates.append(Path(data_root) / path)
+    candidates.append(Path(record["_manifest_dir"]) / path)
+    candidates.append(path)
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
+def load_audio(path, sample_rate):
+    wav, sr = torchaudio.load(str(path))
+    wav = wav.float()
+    if wav.shape[0] > 1:
+        wav = wav.mean(dim=0, keepdim=True)
+    if sr != sample_rate:
+        wav = torchaudio.functional.resample(wav, sr, sample_rate)
+    return wav.squeeze(0)
+
+
+def repeat_to_length(wav, length):
+    if wav.numel() == 0:
+        raise ValueError("Encountered empty waveform")
+    if wav.numel() >= length:
+        return wav
+    repeats = int(np.ceil(length / wav.numel()))
+    return wav.repeat(repeats)[:length]
+
+
+def crop_pair(mixture, target, length, random_crop):
+    min_len = min(mixture.numel(), target.numel())
+    mixture = mixture[:min_len]
+    target = target[:min_len]
+    if min_len < length:
+        return repeat_to_length(mixture, length), repeat_to_length(target, length)
+    start = random.randint(0, min_len - length) if random_crop else max(0, (min_len - length) // 2)
+    return mixture[start:start + length], target[start:start + length]
+
+
+class PairedWaveDataset(Dataset):
+    def __init__(self, manifest, cfg, split, data_root=None):
+        self.records = read_json_manifest(manifest)
+        self.cfg = cfg
+        self.split = split
+        self.data_root = data_root
+        self.sample_rate = int(cfg["data"]["sample_rate"])
+        self.clip_samples = int(float(cfg["data"]["clip_seconds"]) * self.sample_rate)
+
+    def __len__(self):
+        return len(self.records)
+
+    def __getitem__(self, index):
+        record = self.records[index]
+        mixture = load_audio(resolve_path(pick_key(record, "mixture"), record, self.data_root), self.sample_rate)
+        target = load_audio(resolve_path(pick_key(record, "target"), record, self.data_root), self.sample_rate)
+        mixture, target = crop_pair(mixture, target, self.clip_samples, self.split == "train")
+        
+        if self.split == "train" and self.cfg["data"].get("augment", False):
+            aug_prob = float(self.cfg["data"].get("aug_prob", 0.5))
+            if random.random() < aug_prob:
+                lo, hi = self.cfg["data"].get("aug_gain_range_db", [-6.0, 6.0])
+                gain_db = random.uniform(float(lo), float(hi))
+                gain = 10 ** (gain_db / 20.0)
+                mixture = mixture * gain
+                target = target * gain
+            
+            if random.random() < aug_prob:
+                noise = mixture - target
+                lo, hi = self.cfg["data"].get("aug_snr_remix_range", [0.0, 20.0])
+                target_snr = random.uniform(float(lo), float(hi))
+                target_rms = target.pow(2).mean().sqrt().clamp(min=1e-8)
+                noise_rms = noise.pow(2).mean().sqrt().clamp(min=1e-8)
+                target_noise_rms = target_rms / (10 ** (target_snr / 20.0))
+                mixture = target + noise * (target_noise_rms / noise_rms)
+                
+        return {"mixture": mixture, "target": target}
+
+
+def collate_batch(items):
+    return {
+        "mixture": torch.stack([item["mixture"] for item in items], dim=0),
+        "target": torch.stack([item["target"] for item in items], dim=0),
+    }
+
+
+def make_stft(wav, cfg, window):
+    stft_cfg = cfg["stft"]
+    spec = torch.stft(
+        wav,
+        n_fft=int(stft_cfg["n_fft"]),
+        hop_length=int(stft_cfg["hop_length"]),
+        win_length=int(stft_cfg["win_length"]),
+        window=window,
+        return_complex=True,
+    )
+    return torch.view_as_real(spec)
+
+
+def make_istft(spec, cfg, window, length):
+    stft_cfg = cfg["stft"]
+    complex_spec = torch.complex(spec[..., 0], spec[..., 1])
+    return torch.istft(
+        complex_spec,
+        n_fft=int(stft_cfg["n_fft"]),
+        hop_length=int(stft_cfg["hop_length"]),
         win_length=int(stft_cfg["win_length"]),
         window=window,
         length=length,
     )
 
 
-def si_sdr(estimate, target, eps=1e-8):
-    estimate = estimate - estimate.mean(dim=-1, keepdim=True)
-    target = target - target.mean(dim=-1, keepdim=True)
-    projection = (estimate * target).sum(dim=-1, keepdim=True) * target / (target.pow(2).sum(dim=-1, keepdim=True) + eps)
-    noise = estimate - projection
-    return 10 * torch.log10((projection.pow(2).sum(dim=-1) + eps) / (noise.pow(2).sum(dim=-1) + eps))
-
-
-def magnitude_l1(estimate_spec, target_spec):
-    estimate_mag = torch.sqrt(estimate_spec[..., 0].pow(2) + estimate_spec[..., 1].pow(2) + 1e-12)
-    target_mag = torch.sqrt(target_spec[..., 0].pow(2) + target_spec[..., 1].pow(2) + 1e-12)
-    return torch.mean(torch.abs(estimate_mag - target_mag))
-
-
 def compute_batch(model, batch, cfg, window, device):
     mixture = batch["mixture"].to(device)
     target = batch["target"].to(device)
+    
+    stft_cfg = cfg["stft"]
+    loss_cfg = cfg["loss"]
+    c = float(loss_cfg["compress_factor"])
+    
     mixture_spec = make_stft(mixture, cfg, window)
+    
+    amp_enabled = bool(cfg["training"].get("use_amp", False)) and device.type == "cuda"
+    with torch.amp.autocast("cuda", enabled=amp_enabled):
+        estimate_spec = model(mixture_spec)
+    
+    estimate_spec = estimate_spec.float()
     target_spec = make_stft(target, cfg, window)
-    estimate_spec = model(mixture_spec)
-    estimate = make_istft(estimate_spec, cfg, window, target.shape[-1])
-    loss = (
-        float(cfg["loss"]["si_sdr_weight"]) * (-si_sdr(estimate, target).mean())
-        + float(cfg["loss"]["magnitude_l1_weight"]) * magnitude_l1(estimate_spec, target_spec)
-    )
+    
+    min_t = min(estimate_spec.shape[2], target_spec.shape[2])
+    estimate_spec = estimate_spec[:, :, :min_t, :]
+    target_spec = target_spec[:, :, :min_t, :]
+    
+    est_real, est_imag = estimate_spec[..., 0], estimate_spec[..., 1]
+    tgt_real, tgt_imag = target_spec[..., 0], target_spec[..., 1]
+    
+    est_mag = torch.sqrt(est_real**2 + est_imag**2 + 1e-12)
+    tgt_mag = torch.sqrt(tgt_real**2 + tgt_imag**2 + 1e-12)
+    
+    est_real_c = est_real / (est_mag**(1 - c))
+    est_imag_c = est_imag / (est_mag**(1 - c))
+    tgt_real_c = tgt_real / (tgt_mag**(1 - c))
+    tgt_imag_c = tgt_imag / (tgt_mag**(1 - c))
+    
+    real_loss = torch.mean((est_real_c - tgt_real_c)**2)
+    imag_loss = torch.mean((est_imag_c - tgt_imag_c)**2)
+    mag_loss = torch.mean((est_mag**c - tgt_mag**c)**2)
+    
+    estimate_wav = make_istft(estimate_spec, cfg, window, target.shape[-1])
+    min_wav_len = min(estimate_wav.shape[-1], target.shape[-1])
+    estimate_wav = estimate_wav[..., :min_wav_len]
+    target_wav = target[..., :min_wav_len]
+    
+    eps = 1e-8
+    true_energy = torch.sum(torch.square(target_wav), dim=-1, keepdim=True)
+    y_target = torch.sum(target_wav * estimate_wav, dim=-1, keepdim=True) * target_wav / (true_energy + eps)
+    target_energy = torch.sum(torch.square(y_target), dim=-1, keepdim=True)
+    noise_energy = torch.sum(torch.square(estimate_wav - y_target), dim=-1, keepdim=True)
+    sisnr = -torch.log10((target_energy + eps) / (noise_energy + eps)).mean()
+    
+    loss = float(loss_cfg["lamda_ri"]) * (real_loss + imag_loss) + float(loss_cfg["lamda_mag"]) * mag_loss + sisnr
+    
     metrics = {
-        "si_sdr": float(si_sdr(estimate, target).mean().detach().cpu()),
-        "si_sdri": float((si_sdr(estimate, target) - si_sdr(mixture, target)).mean().detach().cpu()),
+        "loss": float(loss.detach().cpu()),
+        "ri_loss": float((real_loss + imag_loss).detach().cpu()),
+        "mag_loss": float(mag_loss.detach().cpu()),
+        "sisnr": float(sisnr.detach().cpu()),
     }
     return loss, metrics
 
@@ -230,7 +437,7 @@ def unwrap_model(model):
     return model.module if isinstance(model, torch.nn.DataParallel) else model
 
 
-def save_checkpoint(path, model, optimizer, scheduler, cfg, epoch, best_metric, bad_epochs=0):
+def save_checkpoint(path, model, optimizer, scheduler, cfg, epoch, best_metric, bad_epochs=0, scaler=None):
     path.parent.mkdir(parents=True, exist_ok=True)
     metadata = reproducibility_metadata(cfg, checkpoint_id=path.stem)
     torch.save(
@@ -238,6 +445,7 @@ def save_checkpoint(path, model, optimizer, scheduler, cfg, epoch, best_metric, 
             "model": unwrap_model(model).state_dict(),
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict() if scheduler is not None else None,
+            "scaler": scaler.state_dict() if scaler is not None else None,
             "config": cfg,
             "metadata": metadata,
             "epoch": epoch,
@@ -248,7 +456,7 @@ def save_checkpoint(path, model, optimizer, scheduler, cfg, epoch, best_metric, 
     )
 
 
-def load_checkpoint(path, model, optimizer=None, scheduler=None, device="cpu"):
+def load_checkpoint(path, model, optimizer=None, scheduler=None, device="cpu", scaler=None):
     try:
         ckpt = torch.load(str(path), map_location=device, weights_only=False)
     except TypeError:
@@ -267,6 +475,8 @@ def load_checkpoint(path, model, optimizer=None, scheduler=None, device="cpu"):
         optimizer.load_state_dict(ckpt["optimizer"])
     if scheduler is not None and ckpt.get("scheduler") is not None:
         scheduler.load_state_dict(ckpt["scheduler"])
+    if scaler is not None and ckpt.get("scaler") is not None:
+        scaler.load_state_dict(ckpt["scaler"])
     return int(ckpt.get("epoch", 0)), ckpt.get("best_metric"), int(ckpt.get("bad_epochs", 0))
 
 
@@ -282,7 +492,7 @@ def make_model(cfg, device, data_parallel=False):
 
 
 def make_optimizer_scheduler(model, cfg):
-    optimizer = torch.optim.AdamW(
+    optimizer = torch.optim.Adam(
         model.parameters(),
         lr=float(cfg["optimizer"]["lr"]),
         weight_decay=float(cfg["optimizer"]["weight_decay"]),
@@ -298,7 +508,7 @@ def make_optimizer_scheduler(model, cfg):
     return optimizer, scheduler
 
 
-def run_epoch(model, loader, cfg, window, device, optimizer=None):
+def run_epoch(model, loader, cfg, window, device, optimizer=None, scaler=None):
     train = optimizer is not None
     model.train(train)
     values = []
@@ -307,15 +517,24 @@ def run_epoch(model, loader, cfg, window, device, optimizer=None):
         iterator = tqdm(loader, desc="train" if train else "valid", dynamic_ncols=True, leave=False, ascii=True)
     for batch in iterator:
         if train:
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
         loss, metrics = compute_batch(model, batch, cfg, window, device)
         if train:
-            loss.backward()
-            grad_clip = cfg["optimizer"].get("grad_clip_norm")
-            if grad_clip:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), float(grad_clip))
-            optimizer.step()
-        item = {"loss": float(loss.detach().cpu()), **metrics}
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                grad_clip = cfg["optimizer"].get("grad_clip_norm")
+                if grad_clip:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), float(grad_clip))
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                grad_clip = cfg["optimizer"].get("grad_clip_norm")
+                if grad_clip:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), float(grad_clip))
+                optimizer.step()
+        item = {**metrics}
         values.append(item)
         if hasattr(iterator, "set_postfix"):
             iterator.set_postfix({key: f"{value:.4g}" for key, value in item.items()})
@@ -394,19 +613,34 @@ def main():
     valid_loader = make_loader(cfg["data"]["valid_manifest"], cfg, "valid", args.data_root)
     model = make_model(cfg, device, data_parallel=args.data_parallel)
     optimizer, scheduler = make_optimizer_scheduler(model, cfg)
+    window_name = cfg["stft"].get("window", "hann")
     window = torch.hann_window(int(cfg["stft"]["win_length"]), device=device)
+    if window_name == "sqrt_hann":
+        window = window.sqrt()
+
+    use_amp = bool(cfg["training"].get("use_amp", False)) and device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     start_epoch = 0
     best_metric = None
     bad_epochs = 0
     if cfg["experiment"].get("resume_from"):
         try:
-            start_epoch, best_metric, bad_epochs = load_checkpoint(cfg["experiment"]["resume_from"], model, optimizer, scheduler, device)
+            start_epoch, best_metric, bad_epochs = load_checkpoint(cfg["experiment"]["resume_from"], model, optimizer, scheduler, device, scaler=scaler)
             print(
                 f"Resumed from {cfg['experiment']['resume_from']} at epoch={start_epoch} "
                 f"best_metric={best_metric} bad_epochs={bad_epochs}",
                 flush=True,
             )
+            
+            # Tự động chọn LR thấp nhất giữa checkpoint và cấu hình
+            config_lr = float(cfg["optimizer"]["lr"])
+            for param_group in optimizer.param_groups:
+                current_lr = param_group['lr']
+                if config_lr < current_lr:
+                    print(f"Bắt buộc hạ LR từ {current_lr} xuống {config_lr} theo cấu hình mới.", flush=True)
+                    param_group['lr'] = config_lr
+
         except Exception as exc:
             if not args.ignore_bad_resume:
                 raise
@@ -429,7 +663,7 @@ def main():
     early_stop_min_epochs = int(cfg["training"].get("early_stop_min_epochs", 0))
     for epoch in range(start_epoch + 1, int(cfg["training"]["epochs"]) + 1):
         start = time.time()
-        train_metrics = run_epoch(model, train_loader, cfg, window, device, optimizer)
+        train_metrics = run_epoch(model, train_loader, cfg, window, device, optimizer, scaler)
         with torch.no_grad():
             valid_metrics = run_epoch(model, valid_loader, cfg, window, device)
         monitor_value = valid_metrics.get(monitor, -valid_metrics["loss"])
@@ -447,9 +681,9 @@ def main():
             bad_epochs = 0
         else:
             bad_epochs += 1
-        save_checkpoint(output_dir / "last.pt", model, optimizer, scheduler, cfg, epoch, best_metric, bad_epochs)
+        save_checkpoint(output_dir / "last.pt", model, optimizer, scheduler, cfg, epoch, best_metric, bad_epochs, scaler=scaler)
         if is_best:
-            save_checkpoint(output_dir / "best.pt", model, optimizer, scheduler, cfg, epoch, best_metric, bad_epochs)
+            save_checkpoint(output_dir / "best.pt", model, optimizer, scheduler, cfg, epoch, best_metric, bad_epochs, scaler=scaler)
         print(
             f"epoch={epoch} time={time.time() - start:.1f}s "
             f"train={train_metrics} valid={valid_metrics} best_{monitor}={best_metric} "
