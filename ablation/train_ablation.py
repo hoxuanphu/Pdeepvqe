@@ -540,13 +540,17 @@ def main():
             print(f"  >>> Saved best model ({monitor}={best_metric:.6f})", flush=True)
             
         current_lr = optimizer.param_groups[0]['lr']
-        print(
+        log_str = (
             f"Epoch {epoch:>3}/{cfg['training']['epochs']} | "
             f"Train Loss: {train_metrics['loss']:.6f} (ri={train_metrics['ri_loss']:.4f}, mag={train_metrics['mag_loss']:.4f}, sisnr={train_metrics['sisnr']:.4f}) | "
             f"Valid Loss: {valid_metrics['loss']:.6f} (ri={valid_metrics['ri_loss']:.4f}, mag={valid_metrics['mag_loss']:.4f}, sisnr={valid_metrics['sisnr']:.4f}) | "
-            f"LR: {current_lr:.2e} | Time: {int(time.time() - start)}s",
-            flush=True,
+            f"LR: {current_lr:.2e} | Time: {int(time.time() - start)}s"
         )
+        print(log_str, flush=True)
+        
+        # Ghi log ra file
+        with open(output_dir / "train_log.txt", "a", encoding="utf-8") as f:
+            f.write(log_str + "\n")
         if early_stop_patience is not None and epoch >= early_stop_min_epochs and bad_epochs >= early_stop_patience:
             print(
                 f"Early stopping {args.config_id}: {monitor} did not improve by "
