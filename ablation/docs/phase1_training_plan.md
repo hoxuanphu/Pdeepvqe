@@ -126,5 +126,19 @@ python ablation/collect_ablation_results.py
 ## 8. Trang Thai Hien Tai
 
 - Baseline da duoc khoa va co quality benchmark day du PESQ/STOI/SI-SDR.
-- Cac ablation variants moi co architecture benchmark, chua co quality benchmark vi chua train.
-- Buoc tiep theo: train `B1a`, `B1b`, `C1`.
+- Da chay danh gia **B1a (PReLU shared)**. Ket qua so voi Baseline (V3):
+
+| Metric | Baseline (V3) | B1a (PReLU shared) | Thay doi |
+| --- | ---: | ---: | ---: |
+| Params | 7,509,996 | 7,510,016 | +20 |
+| PESQ | 2.8560 | 2.7170 | **-0.1390** |
+| STOI | 0.9448 | 0.9384 | **-0.0064** |
+| SI-SDR | 18.57 | 17.44 | **-1.13 dB** |
+| RTF (mean) | 0.014952 | 0.013391 | -0.0015 |
+
+**Nhan xet B1a**:
+- B1a lam giam chat luong am thanh kha ro ret tren tat ca cac chi so (PESQ giam ~0.14, SI-SDR giam > 1dB) so voi baseline.
+- RTF co giam mot chut nhung su suy giam quality qua nang, chung to PReLU dang `shared` khong du capacity de bat duoc cac dac trung can thiet so voi ham kich hoat mac dinh cua Baseline.
+- Ket luan tam thoi: `B1a` bi loai khoi danh sach ung vien trien khai.
+
+- Buoc tiep theo: Danh gia `B1b` (PReLU per-channel) va `C1` (DW-Conv) xem chat luong co bi giam tuong tu khong. Neu dang train do, hay doi chung hoan tat va kiem tra ket qua bang script tuong tu.
