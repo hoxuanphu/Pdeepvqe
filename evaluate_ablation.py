@@ -67,9 +67,6 @@ if window_name == "sqrt_hann":
 # 3. CHUẨN BỊ TẬP TEST TỪ MANIFEST
 # ==========================================
 test_manifest = cfg["data"]["test_manifest"]
-if DATA_ROOT:
-    test_manifest = str(Path(DATA_ROOT) / test_manifest) if not Path(test_manifest).is_absolute() else test_manifest
-    
 records = read_json_manifest(test_manifest)
 
 if EVAL_MAX_SAMPLES is not None:
