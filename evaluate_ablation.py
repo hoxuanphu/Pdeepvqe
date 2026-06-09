@@ -44,7 +44,7 @@ print(f"Thư mục chứa kết quả: {output_dir}")
 # ==========================================
 model = make_model(cfg, device, data_parallel=False)
 
-if not best_ckpt_path.exists():
+if not Path(best_ckpt_path).exists():
     raise FileNotFoundError(f"Không tìm thấy checkpoint: {best_ckpt_path}")
 
 print(f"Đang tải trọng số từ: {best_ckpt_path}")
