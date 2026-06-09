@@ -64,20 +64,14 @@ if window_name == "sqrt_hann":
     window = window.sqrt()
 
 # ==========================================
-# 3. CHUẨN BỊ TẬP TEST TỪ CSV
+# 3. CHUẨN BỊ TẬP TEST TỪ MANIFEST
 # ==========================================
-test_csv_path = "/content/data/voicebank-demand/test.csv"
-if not os.path.exists(test_csv_path):
-    print("Cảnh báo: không tìm thấy test.csv ở ổ Local SSD, thử tìm trong thư mục cấu hình...")
-    if "test_csv" in cfg["data"]:
-        test_csv_path = cfg["data"]["test_csv"]
-        
-print(f"Đang đọc danh sách test từ: {test_csv_path}")
-df_test = pd.read_csv(test_csv_path)
+test_manifest = cfg["data"]["test_manifest"]
+records = read_json_manifest(test_manifest)
 
 if EVAL_MAX_SAMPLES is not None:
-    df_test = df_test.head(EVAL_MAX_SAMPLES)
-print(f"Test samples: {len(df_test)}")
+    records = records[:EVAL_MAX_SAMPLES]
+print(f"Test samples: {len(records)}")
 
 sisdr_metric = ScaleInvariantSignalDistortionRatio().to(device)
 results = []
@@ -89,10 +83,10 @@ EVAL_SR = int(cfg["data"]["sample_rate"])
 # 4. CHẠY ĐÁNH GIÁ
 # ==========================================
 with torch.no_grad():
-    for idx, row in tqdm(df_test.iterrows(), total=len(df_test), desc=f"Evaluating {CONFIG_ID}"):
-        # Lấy đường dẫn từ CSV
-        noisy_path = row["noisy_wav"]
-        clean_path = row["clean_wav"]
+    for idx, record in tqdm(enumerate(records), total=len(records), desc=f"Evaluating {CONFIG_ID}"):
+        # Resolve đường dẫn (hỗ trợ Kaggle DATA_ROOT)
+        noisy_path = resolve_path(pick_key(record, "mixture"), record, data_root=DATA_ROOT)
+        clean_path = resolve_path(pick_key(record, "target"), record, data_root=DATA_ROOT)
         
         # Load audio
         noisy_wav, sr_n = torchaudio.load(str(noisy_path))
@@ -174,7 +168,7 @@ with torch.no_grad():
             stoi_noisy = float('nan')
             
         results.append({
-            'ID': row.get('ID', f'Sample_{idx}'),
+            'ID': record.get('id', f'Sample_{idx}'),
             'PESQ_enhanced': round(pesq_enhanced, 4),
             'PESQ_noisy': round(pesq_noisy, 4),
             'PESQ_improvement': round(pesq_enhanced - pesq_noisy, 4) if not (np.isnan(pesq_enhanced) or np.isnan(pesq_noisy)) else float('nan'),
