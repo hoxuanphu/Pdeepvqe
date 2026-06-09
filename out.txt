@@ -1,0 +1,78 @@
+import glob
+import pandas as pd
+
+def create_csv(clean_dir, noisy_dir, output_csv):
+    clean_files = sorted(glob.glob(os.path.join(clean_dir, "*.wav")))
+    noisy_files = sorted(glob.glob(os.path.join(noisy_dir, "*.wav")))
+    
+    assert len(clean_files) == len(noisy_files), f"Số lượng file không khớp! ({len(clean_files)} != {len(noisy_files)})"
+    
+    data = []
+    for c, n in zip(clean_files, noisy_files):
+        filename = os.path.basename(c)
+        data.append({
+            "ID": filename.replace(".wav", ""),
+            "clean_wav": os.path.abspath(c),
+            "noisy_wav": os.path.abspath(n)
+        })
+        
+    df = pd.DataFrame(data)
+    df.to_csv(output_csv, index=False)
+    print(f"Đã tạo {output_csv} với {len(df)} mẫu.")
+
+base_dir = data_dir
+# Tạo file CSV thô
+create_csv(f"{base_dir}/clean_trainset_28spk_wav", f"{base_dir}/noisy_trainset_28spk_wav", f"{base_dir}/train_full.csv")
+create_csv(f"{base_dir}/clean_testset_wav", f"{base_dir}/noisy_testset_wav", f"{base_dir}/test.csv")
+
+# Tách train_full thành train (90%) và valid (10%)
+df_train_full = pd.read_csv(f"{base_dir}/train_full.csv")
+df_train_full = df_train_full.sample(frac=1, random_state=42).reset_index(drop=True)
+
+split_idx = int(len(df_train_full) * 0.90)
+df_train_full.iloc[:split_idx].to_csv(f"{base_dir}/train.csv", index=False)
+df_train_full.iloc[split_idx:].to_csv(f"{base_dir}/valid.csv", index=False)
+
+print(f"Train: {split_idx} | Valid: {len(df_train_full) - split_idx}")
+print("Hoàn tất tạo metadata (train.csv, valid.csv, test.csv)!")
+
+---CELL---
+
+CONFIG = {
+    'seed': 1234,
+    'sample_rate': 16000,
+    'n_fft': 512,
+    'hop_length': 256,
+    'win_length': 512,
+    
+    'batch_size': 4,
+    'num_workers': 2,
+    'epochs': 100,
+    'lr': 1e-3,          # Cập nhật theo repo gốc
+    'grad_clip': 5.0,
+    
+    # Loss weights
+    'lamda_ri': 30,
+    'lamda_mag': 70,
+    'compress_factor': 0.3,
+    
+    'train_csv': f'{data_dir}/train.csv',
+    'valid_csv': f'{data_dir}/valid.csv',
+    'test_csv': f'{data_dir}/test.csv',
+    
+    'output_dir': '/content/drive/MyDrive/DeepVQE_Workspace/checkpoints/deepvqe_vctk',
+    
+    # Scheduler
+    'scheduler_factor': 0.5,
+    'scheduler_patience': 5,
+    'scheduler_min_lr': 1e-6,
+    
+    # Early stopping
+    'early_stopping_patience': 15,
+}
+
+print('Config:', CONFIG)
+
+
+---CELL---
+
