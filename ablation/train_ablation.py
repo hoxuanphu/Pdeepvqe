@@ -222,7 +222,7 @@ def compute_batch(model, batch, cfg, window, device):
     y_target = torch.sum(target_wav * estimate_wav, dim=-1, keepdim=True) * target_wav / (true_energy + eps)
     target_energy = torch.sum(torch.square(y_target), dim=-1, keepdim=True)
     noise_energy = torch.sum(torch.square(estimate_wav - y_target), dim=-1, keepdim=True)
-    sisnr = -torch.log10((target_energy + eps) / (noise_energy + eps)).mean()
+    sisnr = -10 * torch.log10((target_energy + eps) / (noise_energy + eps)).mean()
     
     loss = float(loss_cfg["lamda_ri"]) * (real_loss + imag_loss) + float(loss_cfg["lamda_mag"]) * mag_loss + sisnr
     

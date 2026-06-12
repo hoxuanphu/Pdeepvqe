@@ -54,9 +54,16 @@ BASE_TRAIN_CONFIG = {
         "patience": 5,
         "min_lr": 1e-6,
     },
+    "logging": {
+        "use_wandb": True,
+        "wandb_project": "DeepVQE-Ablation",
+        "eval_pesq_every": 5,
+        "eval_pesq_samples": 50,
+        "log_audio_every": 5,
+    },
     "training": {
         "device": "cuda",
-        "batch_size": 4,
+        "batch_size": 8,
         "epochs": 100,
         "checkpoint_monitor": "loss",
         "checkpoint_mode": "min",
