@@ -81,6 +81,13 @@ def apply_notebook_config(cfg, flat_cfg):
         stft["window"] = flat_cfg["stft_window"]
     if "sample_rate" in flat_cfg:
         data["sample_rate"] = flat_cfg["sample_rate"]
+    for source_key, target_key in (
+        ("train_csv", "train_manifest"),
+        ("valid_csv", "valid_manifest"),
+        ("test_csv", "test_manifest"),
+    ):
+        if source_key in flat_cfg:
+            data[target_key] = flat_cfg[source_key]
     if "seed" in flat_cfg:
         experiment["seed"] = flat_cfg["seed"]
     return cfg
@@ -224,6 +231,7 @@ def main():
     metric_modules = optional_metric_modules()
 
     values = {"si_sdr": [], "pesq": [], "stoi": []}
+    eval_duration_samples = 0
     notes = list(load_notes)
     notes.append(f"STFT window={cfg['stft'].get('window', 'hann')}")
     if metric_modules["pesq"] is None:
@@ -236,6 +244,7 @@ def main():
         mixture = load_audio(resolve_path(pick_path(record, ["mixture", "mixture_path", "mix", "mix_path", "noisy", "noisy_wav"]), record, args.data_root), sample_rate)
         target = load_audio(resolve_path(pick_path(record, ["target", "target_path", "clean", "target_wav", "clean_wav"]), record, args.data_root), sample_rate)
         length = min(mixture.numel(), target.numel())
+        eval_duration_samples += int(length)
         mixture = align_length(mixture, length)
         target = align_length(target, length)
         enhanced = enhance(model, mixture, cfg, window, device)
@@ -259,6 +268,8 @@ def main():
     row = {
         "config_id": args.config_id,
         "checkpoint_id": checkpoint_id,
+        "num_eval_items": len(records),
+        "eval_duration_s": eval_duration_samples / sample_rate,
         "pesq": np.mean(values["pesq"]) if values["pesq"] else "",
         "stoi": np.mean(values["stoi"]) if values["stoi"] else "",
         "si_sdr": np.mean(values["si_sdr"]) if values["si_sdr"] else "",
@@ -288,6 +299,8 @@ def main():
         "onnxruntime_version",
         "num_threads",
         "checkpoint_id",
+        "num_eval_items",
+        "eval_duration_s",
         "pesq",
         "stoi",
         "si_sdr",

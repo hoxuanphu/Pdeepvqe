@@ -16,6 +16,8 @@ SUMMARY_COLUMNS = [
     "onnxruntime_version",
     "num_threads",
     "checkpoint_id",
+    "num_eval_items",
+    "eval_duration_s",
     "params",
     "params_delta_pct",
     "macs",
@@ -29,7 +31,9 @@ SUMMARY_COLUMNS = [
     "pesq",
     "pesq_delta",
     "stoi",
+    "stoi_delta",
     "si_sdr",
+    "si_sdr_delta",
     "dnsmos_ovrl",
     "dnsmos_ovrl_delta",
     "dnsmos_sig",
@@ -99,6 +103,17 @@ def main():
         merged["params_delta_pct"] = pct_delta(merged["params"], baseline.get("params"))
         merged["macs_delta_pct"] = pct_delta(merged["macs"], baseline.get("macs"))
         merged["rtf_delta_pct"] = pct_delta(merged["streaming_rtf"], baseline.get("streaming_rtf"))
+        quality_baseline = quality.get("Baseline", {})
+        for metric, delta_column in (
+            ("pesq", "pesq_delta"),
+            ("stoi", "stoi_delta"),
+            ("si_sdr", "si_sdr_delta"),
+            ("dnsmos_ovrl", "dnsmos_ovrl_delta"),
+        ):
+            value = to_float(merged.get(metric))
+            base_value = to_float(quality_baseline.get(metric))
+            if value is not None and base_value is not None:
+                merged[delta_column] = value - base_value
         if merged["notes"] and merged["notes"] not in notes:
             notes.append(merged["notes"])
         merged["notes"] = " | ".join(note for note in notes if note)

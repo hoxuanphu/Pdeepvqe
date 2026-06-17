@@ -1,11 +1,11 @@
 experiment:
-  config_id: C3
-  output_dir: runs/ablation/C3
+  config_id: C2a
+  output_dir: runs/ablation/C2a
 model:
-  prelu_type: per_channel
+  prelu_type:
   dw_residual: true
   use_eca_f: false
   main_block_eca_f: false
   skip_gate:
-  dw_subpixel: false
+  dw_subpixel: true
   gru_hidden: 576

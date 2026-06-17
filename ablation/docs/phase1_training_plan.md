@@ -30,7 +30,7 @@ Day la moc so sanh bat buoc cho tat ca bien the.
 Chay truoc:
 
 ```python
-AB_CONFIGS = ['B1a', 'B1b', 'C1']
+AB_CONFIGS = ['B1a', 'B1b', 'B4', 'C1']
 RUN_TRAINING = True
 RUN_QUALITY_EVAL = True
 RUN_ONNX_EXPORT = False
@@ -42,6 +42,7 @@ Y nghia:
 
 - `B1a`: PReLU shared.
 - `B1b`: PReLU per-channel.
+- `B4`: Hybrid Loss (thu nghiem rieng tren Base arch hoac gan thanh config).
 - `C1`: DW-Conv trong ResidualBlock.
 
 Tat ca phai train tu scratch voi cung split, seed, optimizer, LR schedule, loss, batch size va checkpoint selection rule.
@@ -96,7 +97,7 @@ Tam hoan:
 
 Chi quay lai train cac nhanh nay neu:
 
-- `B1a/B1b/C1/C3` khong tang quality du tot.
+- `B1a/B1b/C1/C3/B4` khong tang quality du tot.
 - Can kiem chung ECA-F du RTF benchmark ban dau xau.
 - Co ke hoach toi uu lai implementation ECA-F de giam runtime overhead.
 

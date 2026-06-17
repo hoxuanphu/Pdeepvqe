@@ -6,4 +6,6 @@ model:
   dw_residual: true
   use_eca_f: true
   main_block_eca_f: false
+  skip_gate:
+  dw_subpixel: false
   gru_hidden: 576

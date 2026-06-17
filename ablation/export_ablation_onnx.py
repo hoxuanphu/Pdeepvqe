@@ -20,13 +20,24 @@ from ablation.deepvqe_ablation import (
     convert_ablation_to_stream,
     stream_sequence,
 )
+from ablation.eval_ablation_quality import (
+    apply_notebook_config,
+    extract_state_dict,
+    load_sidecar_config,
+    load_state_dict_flexible,
+    torch_load_checkpoint,
+)
 
 
 def load_model(checkpoint_path, config_id, device):
-    ckpt = torch.load(str(checkpoint_path), map_location=device)
-    cfg = ckpt.get("config", get_train_config(config_id))
+    ckpt = torch_load_checkpoint(checkpoint_path, "cpu")
+    cfg = ckpt.get("config", get_train_config(config_id)) if isinstance(ckpt, dict) else get_train_config(config_id)
+    if not (isinstance(ckpt, dict) and "config" in ckpt):
+        sidecar_cfg, _ = load_sidecar_config(checkpoint_path)
+        if sidecar_cfg is not None:
+            cfg = apply_notebook_config(cfg, sidecar_cfg)
     model = DeepVQE_Ablation(**cfg["model"]).eval().to(device)
-    model.load_state_dict(ckpt["model"])
+    load_state_dict_flexible(model, extract_state_dict(ckpt))
     return model, cfg
 
 

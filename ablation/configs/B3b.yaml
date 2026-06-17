@@ -1,11 +1,11 @@
 experiment:
-  config_id: Baseline
-  output_dir: runs/ablation/Baseline
+  config_id: B3b
+  output_dir: runs/ablation/B3b
 model:
   prelu_type:
   dw_residual: false
   use_eca_f: false
   main_block_eca_f: false
-  skip_gate:
+  skip_gate: se_f
   dw_subpixel: false
   gru_hidden: 576

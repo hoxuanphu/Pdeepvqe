@@ -12,7 +12,7 @@ BASE_TRAIN_CONFIG = {
     "experiment": {
         "name": "deepvqe_ablation",
         "config_id": "Baseline",
-        "seed": 1337,
+        "seed": 1234,
         "output_dir": "runs/ablation/Baseline",
         "resume_from": None,
     },
@@ -21,6 +21,8 @@ BASE_TRAIN_CONFIG = {
         "dw_residual": False,
         "use_eca_f": False,
         "main_block_eca_f": False,
+        "skip_gate": None,
+        "dw_subpixel": False,
         "gru_hidden": 576,
     },
     "stft": {
@@ -37,7 +39,7 @@ BASE_TRAIN_CONFIG = {
         "train_manifest": "data/manifests/train.jsonl",
         "valid_manifest": "data/manifests/valid.jsonl",
         "test_manifest": "data/manifests/test.jsonl",
-        "augment": False,
+        "augment": True,
         "aug_gain_range_db": [-6.0, 6.0],
         "aug_snr_remix_range": [0.0, 20.0],
         "aug_prob": 0.5,

@@ -46,13 +46,26 @@ ABLATION_CONFIGS = {
         "dw_residual": False,
         "use_eca_f": True,
         "main_block_eca_f": False,
+        "skip_gate": None,
+        "dw_subpixel": False,
         "gru_hidden": BASE_GRU_HIDDEN,
     },
-    "B3": {
+    "B3a": {
         "prelu_type": None,
         "dw_residual": False,
-        "use_eca_f": True,
-        "main_block_eca_f": True,
+        "use_eca_f": False,
+        "main_block_eca_f": False,
+        "skip_gate": "eca_f",
+        "dw_subpixel": False,
+        "gru_hidden": BASE_GRU_HIDDEN,
+    },
+    "B3b": {
+        "prelu_type": None,
+        "dw_residual": False,
+        "use_eca_f": False,
+        "main_block_eca_f": False,
+        "skip_gate": "se_f",
+        "dw_subpixel": False,
         "gru_hidden": BASE_GRU_HIDDEN,
     },
     "C1": {
@@ -60,13 +73,26 @@ ABLATION_CONFIGS = {
         "dw_residual": True,
         "use_eca_f": False,
         "main_block_eca_f": False,
+        "skip_gate": None,
+        "dw_subpixel": False,
         "gru_hidden": BASE_GRU_HIDDEN,
     },
-    "C2": {
+    "C2a": {
+        "prelu_type": None,
+        "dw_residual": True,
+        "use_eca_f": False,
+        "main_block_eca_f": False,
+        "skip_gate": None,
+        "dw_subpixel": True,
+        "gru_hidden": BASE_GRU_HIDDEN,
+    },
+    "C2b": {
         "prelu_type": None,
         "dw_residual": True,
         "use_eca_f": True,
         "main_block_eca_f": False,
+        "skip_gate": None,
+        "dw_subpixel": False,
         "gru_hidden": BASE_GRU_HIDDEN,
     },
     # C3/C4 depend on the B1 tie-breaker. Per-channel matches the previous
@@ -76,6 +102,8 @@ ABLATION_CONFIGS = {
         "dw_residual": True,
         "use_eca_f": False,
         "main_block_eca_f": False,
+        "skip_gate": None,
+        "dw_subpixel": False,
         "gru_hidden": BASE_GRU_HIDDEN,
     },
     "C4": {
@@ -83,6 +111,8 @@ ABLATION_CONFIGS = {
         "dw_residual": True,
         "use_eca_f": True,
         "main_block_eca_f": False,
+        "skip_gate": None,
+        "dw_subpixel": False,
         "gru_hidden": BASE_GRU_HIDDEN,
     },
 }
@@ -90,6 +120,7 @@ ABLATION_CONFIGS = {
 
 LEGACY_CONFIG_ALIASES = {
     "C1b": "C1",
+    "C2": "C2b",
 }
 
 
@@ -100,6 +131,8 @@ LEGACY_CONFIGS = {
         "res_groups": 2,
         "use_eca_f": False,
         "main_block_eca_f": False,
+        "skip_gate": None,
+        "dw_subpixel": False,
         "gru_hidden": BASE_GRU_HIDDEN,
     },
     "C1a-g4": {
@@ -108,6 +141,19 @@ LEGACY_CONFIGS = {
         "res_groups": 4,
         "use_eca_f": False,
         "main_block_eca_f": False,
+        "skip_gate": None,
+        "dw_subpixel": False,
+        "gru_hidden": BASE_GRU_HIDDEN,
+    },
+    # Legacy B3 was ECA-F in main encoder/decoder blocks. Roadmap B3a/B3b
+    # now cover skip gating, but this remains loadable for older runs.
+    "B3": {
+        "prelu_type": None,
+        "dw_residual": False,
+        "use_eca_f": True,
+        "main_block_eca_f": True,
+        "skip_gate": None,
+        "dw_subpixel": False,
         "gru_hidden": BASE_GRU_HIDDEN,
     },
 }
@@ -170,6 +216,15 @@ def _normalize_model_config(config):
     cfg.setdefault("main_block_eca_f", False)
     cfg.setdefault("gru_hidden", BASE_GRU_HIDDEN)
     cfg.setdefault("res_groups", None)
+    cfg.setdefault("skip_gate", None)
+    cfg.setdefault("dw_subpixel", False)
+
+    if cfg["skip_gate"] in ("none", "identity", False):
+        cfg["skip_gate"] = None
+    if cfg["skip_gate"] == "se":
+        cfg["skip_gate"] = "se_f"
+    if cfg["skip_gate"] not in (None, "eca_f", "se_f"):
+        raise ValueError("skip_gate must be None, 'eca_f', or 'se_f'")
 
     allowed = {
         "prelu_type",
@@ -178,6 +233,8 @@ def _normalize_model_config(config):
         "main_block_eca_f",
         "gru_hidden",
         "res_groups",
+        "skip_gate",
+        "dw_subpixel",
     }
     unknown = sorted(set(cfg) - allowed)
     if unknown:
@@ -255,6 +312,49 @@ ECA_F = CausalECA_F
 
 def _attention(channels, enabled):
     return CausalECA_F(channels) if enabled else nn.Identity()
+
+
+class FrequencySE(nn.Module):
+    """Frequency-only squeeze/excitation for causal skip gating."""
+
+    def __init__(self, channels, reduction=8):
+        super().__init__()
+        hidden = max(1, int(channels) // int(reduction))
+        self.gate = nn.Sequential(
+            nn.Conv2d(channels, hidden, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, channels, kernel_size=1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        y = x.mean(dim=3, keepdim=True)
+        return x * self.gate(y)
+
+
+def _skip_gate(channels, gate_type):
+    if gate_type is None:
+        return nn.Identity()
+    if gate_type == "eca_f":
+        return CausalECA_F(channels)
+    if gate_type == "se_f":
+        return FrequencySE(channels)
+    raise ValueError(f"Unsupported skip_gate={gate_type!r}")
+
+
+class DWSubpixelConv2d(nn.Module):
+    """Depthwise-separable version of the original SubpixelConv2d."""
+
+    def __init__(self, in_channels, out_channels, kernel_size=(4, 3)):
+        super().__init__()
+        self.pad = nn.ZeroPad2d([1, 1, 3, 0])
+        self.depthwise = nn.Conv2d(in_channels, in_channels, kernel_size, groups=in_channels)
+        self.pointwise = nn.Conv2d(in_channels, out_channels * 2, kernel_size=1)
+
+    def forward(self, x):
+        y = self.pointwise(self.depthwise(self.pad(x)))
+        y = rearrange(y, "b (r c) t f -> b c t (r f)", r=2)
+        return y
 
 
 class ResidualBlock_Ablation(nn.Module):
@@ -355,9 +455,12 @@ class DecoderBlock_Ablation(nn.Module):
         use_eca_f=False,
         main_block_eca_f=False,
         res_groups=None,
+        skip_gate=None,
+        dw_subpixel=False,
     ):
         super().__init__()
         self.skip_conv = nn.Conv2d(in_channels, in_channels, 1)
+        self.skip_gate = _skip_gate(in_channels, skip_gate)
         self.resblock = ResidualBlock_Ablation(
             in_channels,
             prelu_type=prelu_type,
@@ -365,14 +468,17 @@ class DecoderBlock_Ablation(nn.Module):
             use_eca_f=use_eca_f,
             res_groups=res_groups,
         )
-        self.deconv = SubpixelConv2d(in_channels, out_channels, kernel_size)
+        if dw_subpixel:
+            self.deconv = DWSubpixelConv2d(in_channels, out_channels, kernel_size)
+        else:
+            self.deconv = SubpixelConv2d(in_channels, out_channels, kernel_size)
         self.bn = nn.BatchNorm2d(out_channels)
         self.elu = ActivationFactory(prelu_type, out_channels)
         self.is_last = is_last
         self.main_eca_f = _attention(out_channels, main_block_eca_f and not is_last)
 
     def forward(self, x, x_en):
-        y = x + self.skip_conv(x_en)
+        y = x + self.skip_gate(self.skip_conv(x_en))
         y = self.deconv(self.resblock(y))
         if not self.is_last:
             y = self.elu(self.bn(y))
@@ -388,6 +494,8 @@ class DeepVQE_Ablation(nn.Module):
         use_eca_f=False,
         main_block_eca_f=False,
         gru_hidden=BASE_GRU_HIDDEN,
+        skip_gate=None,
+        dw_subpixel=False,
         **legacy_kwargs,
     ):
         super().__init__()
@@ -398,6 +506,8 @@ class DeepVQE_Ablation(nn.Module):
                 "use_eca_f": use_eca_f,
                 "main_block_eca_f": main_block_eca_f,
                 "gru_hidden": gru_hidden,
+                "skip_gate": skip_gate,
+                "dw_subpixel": dw_subpixel,
                 **legacy_kwargs,
             }
         )
@@ -410,6 +520,11 @@ class DeepVQE_Ablation(nn.Module):
             "main_block_eca_f": cfg["main_block_eca_f"],
             "res_groups": cfg["res_groups"],
         }
+        decoder_kwargs = {
+            **block_kwargs,
+            "skip_gate": cfg["skip_gate"],
+            "dw_subpixel": cfg["dw_subpixel"],
+        }
 
         self.fe = FE()
         self.enblock1 = EncoderBlock_Ablation(2, 64, **block_kwargs)
@@ -420,13 +535,13 @@ class DeepVQE_Ablation(nn.Module):
 
         self.bottle = Bottleneck_Ablation(128 * 9, int(cfg["gru_hidden"]))
 
-        self.deblock5 = DecoderBlock_Ablation(128, 128, **block_kwargs)
-        self.deblock4 = DecoderBlock_Ablation(128, 128, **block_kwargs)
-        self.deblock3 = DecoderBlock_Ablation(128, 128, **block_kwargs)
-        self.deblock2 = DecoderBlock_Ablation(128, 64, **block_kwargs)
+        self.deblock5 = DecoderBlock_Ablation(128, 128, **decoder_kwargs)
+        self.deblock4 = DecoderBlock_Ablation(128, 128, **decoder_kwargs)
+        self.deblock3 = DecoderBlock_Ablation(128, 128, **decoder_kwargs)
+        self.deblock2 = DecoderBlock_Ablation(128, 64, **decoder_kwargs)
         # Keep the original final activation for Baseline parity, but never
         # attach main-block ECA-F to the output mask branch.
-        last_kwargs = dict(block_kwargs)
+        last_kwargs = dict(decoder_kwargs)
         last_kwargs["main_block_eca_f"] = False
         self.deblock1 = DecoderBlock_Ablation(64, 27, **last_kwargs)
         self.ccm = CCM()
@@ -571,6 +686,26 @@ class StreamSubpixelConv2d_Ablation(nn.Module):
         return y, cache
 
 
+class StreamDWSubpixelConv2d_Ablation(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=(4, 3)):
+        super().__init__()
+        self.depthwise = StreamConv2d(
+            in_channels,
+            in_channels,
+            kernel_size,
+            padding=(0, 1),
+            groups=in_channels,
+        )
+        self.pointwise = nn.Conv2d(in_channels, out_channels * 2, kernel_size=1)
+
+    def forward(self, x, cache):
+        """x: (B, C, 1, F), cache: (B, C, 3, F)."""
+        y, cache = self.depthwise(x, cache)
+        y = self.pointwise(y)
+        y = rearrange(y, "b (r c) t f -> b c t (r f)", r=2)
+        return y, cache
+
+
 class StreamDecoderBlock_Ablation(nn.Module):
     def __init__(
         self,
@@ -583,9 +718,12 @@ class StreamDecoderBlock_Ablation(nn.Module):
         use_eca_f=False,
         main_block_eca_f=False,
         res_groups=None,
+        skip_gate=None,
+        dw_subpixel=False,
     ):
         super().__init__()
         self.skip_conv = nn.Conv2d(in_channels, in_channels, 1)
+        self.skip_gate = _skip_gate(in_channels, skip_gate)
         self.resblock = StreamResidualBlock_Ablation(
             in_channels,
             prelu_type=prelu_type,
@@ -593,14 +731,17 @@ class StreamDecoderBlock_Ablation(nn.Module):
             use_eca_f=use_eca_f,
             res_groups=res_groups,
         )
-        self.deconv = StreamSubpixelConv2d_Ablation(in_channels, out_channels, kernel_size)
+        if dw_subpixel:
+            self.deconv = StreamDWSubpixelConv2d_Ablation(in_channels, out_channels, kernel_size)
+        else:
+            self.deconv = StreamSubpixelConv2d_Ablation(in_channels, out_channels, kernel_size)
         self.bn = nn.BatchNorm2d(out_channels)
         self.elu = ActivationFactory(prelu_type, out_channels)
         self.is_last = is_last
         self.main_eca_f = _attention(out_channels, main_block_eca_f and not is_last)
 
     def forward(self, x, x_en, conv_cache, res_cache):
-        y = x + self.skip_conv(x_en)
+        y = x + self.skip_gate(self.skip_conv(x_en))
         y, res_cache = self.resblock(y, res_cache)
         y, conv_cache = self.deconv(y, conv_cache)
         if not self.is_last:
@@ -689,6 +830,8 @@ class StreamDeepVQE_Ablation(nn.Module):
         use_eca_f=False,
         main_block_eca_f=False,
         gru_hidden=BASE_GRU_HIDDEN,
+        skip_gate=None,
+        dw_subpixel=False,
         **legacy_kwargs,
     ):
         super().__init__()
@@ -699,6 +842,8 @@ class StreamDeepVQE_Ablation(nn.Module):
                 "use_eca_f": use_eca_f,
                 "main_block_eca_f": main_block_eca_f,
                 "gru_hidden": gru_hidden,
+                "skip_gate": skip_gate,
+                "dw_subpixel": dw_subpixel,
                 **legacy_kwargs,
             }
         )
@@ -711,6 +856,11 @@ class StreamDeepVQE_Ablation(nn.Module):
             "main_block_eca_f": cfg["main_block_eca_f"],
             "res_groups": cfg["res_groups"],
         }
+        decoder_kwargs = {
+            **block_kwargs,
+            "skip_gate": cfg["skip_gate"],
+            "dw_subpixel": cfg["dw_subpixel"],
+        }
 
         self.fe = FE()
         self.enblock1 = StreamEncoderBlock_Ablation(2, 64, **block_kwargs)
@@ -721,11 +871,11 @@ class StreamDeepVQE_Ablation(nn.Module):
 
         self.bottle = StreamBottleneck_Ablation(128 * 9, int(cfg["gru_hidden"]))
 
-        self.deblock5 = StreamDecoderBlock_Ablation(128, 128, **block_kwargs)
-        self.deblock4 = StreamDecoderBlock_Ablation(128, 128, **block_kwargs)
-        self.deblock3 = StreamDecoderBlock_Ablation(128, 128, **block_kwargs)
-        self.deblock2 = StreamDecoderBlock_Ablation(128, 64, **block_kwargs)
-        last_kwargs = dict(block_kwargs)
+        self.deblock5 = StreamDecoderBlock_Ablation(128, 128, **decoder_kwargs)
+        self.deblock4 = StreamDecoderBlock_Ablation(128, 128, **decoder_kwargs)
+        self.deblock3 = StreamDecoderBlock_Ablation(128, 128, **decoder_kwargs)
+        self.deblock2 = StreamDecoderBlock_Ablation(128, 64, **decoder_kwargs)
+        last_kwargs = dict(decoder_kwargs)
         last_kwargs["main_block_eca_f"] = False
         self.deblock1 = StreamDecoderBlock_Ablation(64, 27, **last_kwargs)
         self.ccm = StreamCCM_Ablation()
@@ -884,7 +1034,12 @@ def convert_ablation_to_stream(stream_model, model, strict=True):
     shape_mismatch = []
 
     for key, value in new_state_dict.items():
-        candidates = (key, key.replace("Conv2d.", ""))
+        candidates = (
+            key,
+            key.replace("Conv2d.", ""),
+            key.replace("conv.Conv2d.", "conv."),
+            key.replace("depthwise.Conv2d.", "depthwise."),
+        )
         matched = None
         for candidate in candidates:
             if candidate in state_dict:

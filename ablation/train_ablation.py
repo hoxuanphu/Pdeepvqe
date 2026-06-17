@@ -35,6 +35,18 @@ PATH_KEYS = {
 }
 
 
+def autocast_context(device_type, enabled):
+    if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
+        return torch.amp.autocast(device_type, enabled=enabled)
+    return torch.cuda.amp.autocast(enabled=enabled)
+
+
+def make_grad_scaler(enabled):
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        return torch.amp.GradScaler("cuda", enabled=enabled)
+    return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
 def seed_everything(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -123,6 +135,31 @@ def crop_pair(mixture, target, length, random_crop):
     return mixture[start:start + length], target[start:start + length]
 
 
+def augment_pair(mixture, target, cfg):
+    """Match the VoiceBank-DEMAND notebook augmentation for train split."""
+    if not bool(cfg["data"].get("augment", False)):
+        return mixture, target
+
+    aug_prob = float(cfg["data"].get("aug_prob", 0.5))
+    if random.random() < aug_prob:
+        lo, hi = cfg["data"].get("aug_gain_range_db", [-6.0, 6.0])
+        gain_db = random.uniform(float(lo), float(hi))
+        gain = 10 ** (gain_db / 20.0)
+        mixture = mixture * gain
+        target = target * gain
+
+    if random.random() < aug_prob:
+        noise = mixture - target
+        lo, hi = cfg["data"].get("aug_snr_remix_range", [0.0, 20.0])
+        target_snr = random.uniform(float(lo), float(hi))
+        target_rms = target.pow(2).mean().sqrt().clamp(min=1e-8)
+        noise_rms = noise.pow(2).mean().sqrt().clamp(min=1e-8)
+        desired_noise_rms = target_rms / (10 ** (target_snr / 20.0))
+        mixture = target + noise * (desired_noise_rms / noise_rms)
+
+    return mixture, target
+
+
 class PairedWaveDataset(Dataset):
     def __init__(self, manifest, cfg, split, data_root=None):
         self.records = read_json_manifest(manifest)
@@ -140,6 +177,8 @@ class PairedWaveDataset(Dataset):
         mixture = load_audio(resolve_path(pick_key(record, "mixture"), record, self.data_root), self.sample_rate)
         target = load_audio(resolve_path(pick_key(record, "target"), record, self.data_root), self.sample_rate)
         mixture, target = crop_pair(mixture, target, self.clip_samples, self.split == "train")
+        if self.split == "train":
+            mixture, target = augment_pair(mixture, target, self.cfg)
         return {"mixture": mixture, "target": target}
 
 
@@ -176,6 +215,16 @@ def make_istft(spec, cfg, window, length):
     )
 
 
+def si_sdr(estimate, target, eps=1e-8):
+    estimate = estimate - estimate.mean(dim=-1, keepdim=True)
+    target = target - target.mean(dim=-1, keepdim=True)
+    target_energy = torch.sum(target * target, dim=-1, keepdim=True).clamp_min(eps)
+    projection = torch.sum(estimate * target, dim=-1, keepdim=True) * target / target_energy
+    noise = estimate - projection
+    ratio = torch.sum(projection * projection, dim=-1) / torch.sum(noise * noise, dim=-1).clamp_min(eps)
+    return 10.0 * torch.log10(ratio.clamp_min(eps))
+
+
 def compute_batch(model, batch, cfg, window, device):
     mixture = batch["mixture"].to(device)
     target = batch["target"].to(device)
@@ -187,7 +236,7 @@ def compute_batch(model, batch, cfg, window, device):
     mixture_spec = make_stft(mixture, cfg, window)
     
     amp_enabled = bool(cfg["training"].get("use_amp", False)) and device.type == "cuda"
-    with torch.amp.autocast("cuda", enabled=amp_enabled):
+    with autocast_context("cuda", enabled=amp_enabled):
         estimate_spec = model(mixture_spec)
     
     estimate_spec = estimate_spec.float()
@@ -480,7 +529,7 @@ def main():
         window = window.sqrt()
 
     use_amp = bool(cfg["training"].get("use_amp", False)) and device.type == "cuda"
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    scaler = make_grad_scaler(enabled=use_amp)
 
     print(f"\n========================================", flush=True)
     print(f"Device: {device}", flush=True)
