@@ -50,7 +50,7 @@ def main():
         y_offline = offline(x)
         y_stream, cache = stream_sequence(stream, x)
 
-        if len(cache) != len(StreamDeepVQE_Ablation.cache_names):
+        if len(cache) != len(stream.get_cache_names()):
             raise AssertionError(f"{config_id}: unexpected cache length {len(cache)}")
         if y_offline.shape != y_stream.shape:
             raise AssertionError(f"{config_id}: shape mismatch {tuple(y_offline.shape)} != {tuple(y_stream.shape)}")

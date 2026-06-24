@@ -1,0 +1,13 @@
+experiment:
+  config_id: D2_temporal_refine
+  output_dir: runs/ablation/D2_temporal_refine
+model:
+  prelu_type:
+  dw_residual: false
+  use_eca_f: false
+  main_block_eca_f: false
+  skip_gate:
+  dw_subpixel: false
+  gru_hidden: 576
+  temporal_refine: true
+  temporal_refine_kernel: 3

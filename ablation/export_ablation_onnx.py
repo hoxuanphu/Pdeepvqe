@@ -74,10 +74,10 @@ def append_result(output_path, row):
         writer.writerows(rows)
 
 
-def cache_feed(cache):
+def cache_feed(cache, cache_names):
     return {
         name: tensor.detach().cpu().numpy()
-        for name, tensor in zip(StreamDeepVQE_Ablation.cache_names, cache)
+        for name, tensor in zip(cache_names, cache)
     }
 
 
@@ -105,14 +105,15 @@ def main():
     simple_path = output_dir / f"{args.config_id}_stream_simple.onnx"
     dummy_frame = torch.randn(1, 257, 1, 2, device=device)
     dummy_cache = stream_model.init_cache(1, 257, device=device)
+    cache_names = stream_model.get_cache_names()
     notes = []
     export_pass = False
     simplify_pass = False
     parity_error = ""
     latency_ms = ""
 
-    input_names = ["mix", *StreamDeepVQE_Ablation.cache_names]
-    output_names = ["enh", *[f"{name}_out" for name in StreamDeepVQE_Ablation.cache_names]]
+    input_names = ["mix", *cache_names]
+    output_names = ["enh", *[f"{name}_out" for name in cache_names]]
 
     try:
         torch.onnx.export(
@@ -161,13 +162,13 @@ def main():
             for _ in range(3):
                 warm_cache = stream_model.init_cache(1, 257, device=device)
                 for frame_idx in range(args.frames):
-                    feed = {"mix": input_np[:, :, frame_idx : frame_idx + 1, :], **cache_feed(warm_cache)}
+                    feed = {"mix": input_np[:, :, frame_idx : frame_idx + 1, :], **cache_feed(warm_cache, cache_names)}
                     values = session.run(output_names, feed)
                     warm_cache = [torch.from_numpy(value) for value in values[1:]]
 
             start = time.perf_counter()
             for frame_idx in range(args.frames):
-                feed = {"mix": input_np[:, :, frame_idx : frame_idx + 1, :], **cache_feed(ort_cache)}
+                feed = {"mix": input_np[:, :, frame_idx : frame_idx + 1, :], **cache_feed(ort_cache, cache_names)}
                 values = session.run(output_names, feed)
                 ort_outputs.append(values[0])
                 ort_cache = [torch.from_numpy(value) for value in values[1:]]

@@ -10,6 +10,7 @@ from copy import deepcopy
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from einops import rearrange
 
 from deepvqe import CCM, FE, SubpixelConv2d
@@ -26,6 +27,35 @@ ABLATION_CONFIGS = {
         "use_eca_f": False,
         "main_block_eca_f": False,
         "gru_hidden": BASE_GRU_HIDDEN,
+    },
+    "D1a_gru704": {
+        "prelu_type": None,
+        "dw_residual": False,
+        "use_eca_f": False,
+        "main_block_eca_f": False,
+        "skip_gate": None,
+        "dw_subpixel": False,
+        "gru_hidden": 704,
+    },
+    "D1b_gru768": {
+        "prelu_type": None,
+        "dw_residual": False,
+        "use_eca_f": False,
+        "main_block_eca_f": False,
+        "skip_gate": None,
+        "dw_subpixel": False,
+        "gru_hidden": 768,
+    },
+    "D2_temporal_refine": {
+        "prelu_type": None,
+        "dw_residual": False,
+        "use_eca_f": False,
+        "main_block_eca_f": False,
+        "skip_gate": None,
+        "dw_subpixel": False,
+        "gru_hidden": BASE_GRU_HIDDEN,
+        "temporal_refine": True,
+        "temporal_refine_kernel": 3,
     },
     "B1a": {
         "prelu_type": "shared",
@@ -218,6 +248,8 @@ def _normalize_model_config(config):
     cfg.setdefault("res_groups", None)
     cfg.setdefault("skip_gate", None)
     cfg.setdefault("dw_subpixel", False)
+    cfg.setdefault("temporal_refine", False)
+    cfg.setdefault("temporal_refine_kernel", 3)
 
     if cfg["skip_gate"] in ("none", "identity", False):
         cfg["skip_gate"] = None
@@ -235,6 +267,8 @@ def _normalize_model_config(config):
         "res_groups",
         "skip_gate",
         "dw_subpixel",
+        "temporal_refine",
+        "temporal_refine_kernel",
     }
     unknown = sorted(set(cfg) - allowed)
     if unknown:
@@ -342,6 +376,40 @@ def _skip_gate(channels, gate_type):
     raise ValueError(f"Unsupported skip_gate={gate_type!r}")
 
 
+class CausalTemporalRefine(nn.Module):
+    """Causal temporal residual refinement over flattened bottleneck features."""
+
+    def __init__(self, features, kernel_size=3):
+        super().__init__()
+        features = int(features)
+        kernel_size = int(kernel_size)
+        if kernel_size < 1:
+            raise ValueError("temporal_refine_kernel must be >= 1")
+        self.features = features
+        self.kernel_size = kernel_size
+        self.norm = nn.LayerNorm(features)
+        self.depthwise = nn.Conv1d(
+            features,
+            features,
+            kernel_size=kernel_size,
+            groups=features,
+            bias=False,
+        )
+        self.pointwise = nn.Conv1d(features, features, kernel_size=1)
+        self.elu = nn.ELU()
+
+    def forward(self, y):
+        """y: (B, T, D). Returns residual delta with the same shape."""
+        if y.shape[-1] != self.features:
+            raise ValueError(f"CausalTemporalRefine expected {self.features} features, got {y.shape[-1]}")
+        z = self.norm(y).transpose(1, 2)
+        z = F.pad(z, (self.kernel_size - 1, 0))
+        z = self.depthwise(z)
+        z = self.pointwise(z)
+        z = self.elu(z)
+        return z.transpose(1, 2)
+
+
 class DWSubpixelConv2d(nn.Module):
     """Depthwise-separable version of the original SubpixelConv2d."""
 
@@ -429,16 +497,23 @@ class EncoderBlock_Ablation(nn.Module):
 
 
 class Bottleneck_Ablation(nn.Module):
-    def __init__(self, input_size, hidden_size):
+    def __init__(self, input_size, hidden_size, temporal_refine=False, temporal_refine_kernel=3):
         super().__init__()
         self.gru = nn.GRU(input_size, hidden_size, batch_first=True)
         self.fc = nn.Linear(hidden_size, input_size)
+        self.refine = (
+            CausalTemporalRefine(input_size, temporal_refine_kernel)
+            if temporal_refine
+            else None
+        )
 
     def forward(self, x):
         """x: (B, C, T, F)."""
         y = rearrange(x, "b c t f -> b t (c f)")
         y = self.gru(y)[0]
         y = self.fc(y)
+        if self.refine is not None:
+            y = y + self.refine(y)
         y = rearrange(y, "b t (c f) -> b c t f", c=x.shape[1])
         return y
 
@@ -496,6 +571,8 @@ class DeepVQE_Ablation(nn.Module):
         gru_hidden=BASE_GRU_HIDDEN,
         skip_gate=None,
         dw_subpixel=False,
+        temporal_refine=False,
+        temporal_refine_kernel=3,
         **legacy_kwargs,
     ):
         super().__init__()
@@ -508,6 +585,8 @@ class DeepVQE_Ablation(nn.Module):
                 "gru_hidden": gru_hidden,
                 "skip_gate": skip_gate,
                 "dw_subpixel": dw_subpixel,
+                "temporal_refine": temporal_refine,
+                "temporal_refine_kernel": temporal_refine_kernel,
                 **legacy_kwargs,
             }
         )
@@ -533,7 +612,12 @@ class DeepVQE_Ablation(nn.Module):
         self.enblock4 = EncoderBlock_Ablation(128, 128, **block_kwargs)
         self.enblock5 = EncoderBlock_Ablation(128, 128, **block_kwargs)
 
-        self.bottle = Bottleneck_Ablation(128 * 9, int(cfg["gru_hidden"]))
+        self.bottle = Bottleneck_Ablation(
+            128 * 9,
+            int(cfg["gru_hidden"]),
+            temporal_refine=cfg["temporal_refine"],
+            temporal_refine_kernel=cfg["temporal_refine_kernel"],
+        )
 
         self.deblock5 = DecoderBlock_Ablation(128, 128, **decoder_kwargs)
         self.deblock4 = DecoderBlock_Ablation(128, 128, **decoder_kwargs)
@@ -660,18 +744,41 @@ class StreamEncoderBlock_Ablation(nn.Module):
 
 
 class StreamBottleneck_Ablation(nn.Module):
-    def __init__(self, input_size, hidden_size):
+    def __init__(self, input_size, hidden_size, temporal_refine=False, temporal_refine_kernel=3):
         super().__init__()
         self.gru = nn.GRU(input_size, hidden_size, batch_first=True)
         self.fc = nn.Linear(hidden_size, input_size)
+        self.refine = (
+            CausalTemporalRefine(input_size, temporal_refine_kernel)
+            if temporal_refine
+            else None
+        )
+        self.refine_cache_size = int(temporal_refine_kernel) - 1 if temporal_refine else 0
 
-    def forward(self, x, cache):
+    def forward(self, x, cache, refine_cache=None):
         """x: (B, C, 1, F), cache: (1, B, hidden_size)."""
         y = rearrange(x, "b c t f -> b t (c f)")
         y, cache = self.gru(y, cache)
         y = self.fc(y)
+        if self.refine is not None:
+            if refine_cache is None:
+                raise ValueError("refine_cache is required when temporal_refine=True")
+            if refine_cache.shape[2] != self.refine_cache_size:
+                raise ValueError(
+                    f"Expected refine_cache length {self.refine_cache_size}, got {refine_cache.shape[2]}"
+                )
+            z = self.refine.norm(y).transpose(1, 2)
+            if self.refine_cache_size > 0:
+                z_with_history = torch.cat([refine_cache, z], dim=2)
+                refine_cache = z_with_history[:, :, -self.refine_cache_size :].contiguous()
+            else:
+                z_with_history = z
+            z = self.refine.depthwise(z_with_history)
+            z = self.refine.pointwise(z)
+            z = self.refine.elu(z)
+            y = y + z.transpose(1, 2)
         y = rearrange(y, "b t (c f) -> b c t f", f=x.shape[-1])
-        return y, cache
+        return y, cache, refine_cache
 
 
 class StreamSubpixelConv2d_Ablation(nn.Module):
@@ -823,6 +930,11 @@ class StreamDeepVQE_Ablation(nn.Module):
         "m_cache",
     )
 
+    def get_cache_names(self):
+        if getattr(self.bottle, "refine", None) is None:
+            return self.cache_names
+        return self.cache_names[:11] + ("temporal_refine_cache",) + self.cache_names[11:]
+
     def __init__(
         self,
         prelu_type=None,
@@ -832,6 +944,8 @@ class StreamDeepVQE_Ablation(nn.Module):
         gru_hidden=BASE_GRU_HIDDEN,
         skip_gate=None,
         dw_subpixel=False,
+        temporal_refine=False,
+        temporal_refine_kernel=3,
         **legacy_kwargs,
     ):
         super().__init__()
@@ -844,6 +958,8 @@ class StreamDeepVQE_Ablation(nn.Module):
                 "gru_hidden": gru_hidden,
                 "skip_gate": skip_gate,
                 "dw_subpixel": dw_subpixel,
+                "temporal_refine": temporal_refine,
+                "temporal_refine_kernel": temporal_refine_kernel,
                 **legacy_kwargs,
             }
         )
@@ -869,7 +985,12 @@ class StreamDeepVQE_Ablation(nn.Module):
         self.enblock4 = StreamEncoderBlock_Ablation(128, 128, **block_kwargs)
         self.enblock5 = StreamEncoderBlock_Ablation(128, 128, **block_kwargs)
 
-        self.bottle = StreamBottleneck_Ablation(128 * 9, int(cfg["gru_hidden"]))
+        self.bottle = StreamBottleneck_Ablation(
+            128 * 9,
+            int(cfg["gru_hidden"]),
+            temporal_refine=cfg["temporal_refine"],
+            temporal_refine_kernel=cfg["temporal_refine_kernel"],
+        )
 
         self.deblock5 = StreamDecoderBlock_Ablation(128, 128, **decoder_kwargs)
         self.deblock4 = StreamDecoderBlock_Ablation(128, 128, **decoder_kwargs)
@@ -905,7 +1026,7 @@ class StreamDeepVQE_Ablation(nn.Module):
         f5 = (f4 + 1) // 2
         hidden = self.bottle.gru.hidden_size
 
-        return [
+        cache = [
             torch.zeros(b, 2, 3, f0, device=device, dtype=dtype),
             torch.zeros(b, 64, 3, f1, device=device, dtype=dtype),
             torch.zeros(b, 64, 3, f1, device=device, dtype=dtype),
@@ -929,39 +1050,78 @@ class StreamDeepVQE_Ablation(nn.Module):
             torch.zeros(b, 64, 3, f1, device=device, dtype=dtype),
             torch.zeros(b, f0, 2, 2, device=device, dtype=dtype),
         ]
+        if self.bottle.refine is not None:
+            refine_cache = torch.zeros(
+                b,
+                self.bottle.refine.features,
+                self.bottle.refine_cache_size,
+                device=device,
+                dtype=dtype,
+            )
+            cache.insert(11, refine_cache)
+        return cache
 
     def forward(self, x, cache):
         """
         x: (B, F, 1, 2)
         cache: list of tensors following ``cache_names``.
         """
-        if len(cache) != len(self.cache_names):
-            raise ValueError(f"Expected {len(self.cache_names)} cache tensors, got {len(cache)}")
+        cache_names = self.get_cache_names()
+        if len(cache) != len(cache_names):
+            raise ValueError(f"Expected {len(cache_names)} cache tensors, got {len(cache)}")
 
-        (
-            en_conv_cache1,
-            en_res_cache1,
-            en_conv_cache2,
-            en_res_cache2,
-            en_conv_cache3,
-            en_res_cache3,
-            en_conv_cache4,
-            en_res_cache4,
-            en_conv_cache5,
-            en_res_cache5,
-            h_cache,
-            de_conv_cache5,
-            de_res_cache5,
-            de_conv_cache4,
-            de_res_cache4,
-            de_conv_cache3,
-            de_res_cache3,
-            de_conv_cache2,
-            de_res_cache2,
-            de_conv_cache1,
-            de_res_cache1,
-            m_cache,
-        ) = cache
+        if self.bottle.refine is not None:
+            (
+                en_conv_cache1,
+                en_res_cache1,
+                en_conv_cache2,
+                en_res_cache2,
+                en_conv_cache3,
+                en_res_cache3,
+                en_conv_cache4,
+                en_res_cache4,
+                en_conv_cache5,
+                en_res_cache5,
+                h_cache,
+                temporal_refine_cache,
+                de_conv_cache5,
+                de_res_cache5,
+                de_conv_cache4,
+                de_res_cache4,
+                de_conv_cache3,
+                de_res_cache3,
+                de_conv_cache2,
+                de_res_cache2,
+                de_conv_cache1,
+                de_res_cache1,
+                m_cache,
+            ) = cache
+        else:
+            temporal_refine_cache = None
+            (
+                en_conv_cache1,
+                en_res_cache1,
+                en_conv_cache2,
+                en_res_cache2,
+                en_conv_cache3,
+                en_res_cache3,
+                en_conv_cache4,
+                en_res_cache4,
+                en_conv_cache5,
+                en_res_cache5,
+                h_cache,
+                de_conv_cache5,
+                de_res_cache5,
+                de_conv_cache4,
+                de_res_cache4,
+                de_conv_cache3,
+                de_res_cache3,
+                de_conv_cache2,
+                de_res_cache2,
+                de_conv_cache1,
+                de_res_cache1,
+                m_cache,
+            ) = cache
 
         en_x0 = self.fe(x)
         en_x1, en_conv_cache1, en_res_cache1 = self.enblock1(en_x0, en_conv_cache1, en_res_cache1)
@@ -970,7 +1130,7 @@ class StreamDeepVQE_Ablation(nn.Module):
         en_x4, en_conv_cache4, en_res_cache4 = self.enblock4(en_x3, en_conv_cache4, en_res_cache4)
         en_x5, en_conv_cache5, en_res_cache5 = self.enblock5(en_x4, en_conv_cache5, en_res_cache5)
 
-        en_xr, h_cache = self.bottle(en_x5, h_cache)
+        en_xr, h_cache, temporal_refine_cache = self.bottle(en_x5, h_cache, temporal_refine_cache)
 
         de_x5, de_conv_cache5, de_res_cache5 = self.deblock5(en_xr, en_x5, de_conv_cache5, de_res_cache5)
         de_x5 = de_x5[..., : en_x4.shape[-1]]
@@ -997,6 +1157,10 @@ class StreamDeepVQE_Ablation(nn.Module):
             en_conv_cache5,
             en_res_cache5,
             h_cache,
+        ]
+        if self.bottle.refine is not None:
+            new_cache.append(temporal_refine_cache)
+        new_cache.extend([
             de_conv_cache5,
             de_res_cache5,
             de_conv_cache4,
@@ -1008,7 +1172,7 @@ class StreamDeepVQE_Ablation(nn.Module):
             de_conv_cache1,
             de_res_cache1,
             m_cache,
-        ]
+        ])
         return x_enh, new_cache
 
     def forward_flat(self, x, *cache):
