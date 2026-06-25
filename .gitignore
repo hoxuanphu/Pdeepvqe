@@ -1,0 +1,47 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyTorch / Machine Learning
+*.pt
+*.pth
+*.ckpt
+runs/
+data/
+results/
+benchmark-result/
+onnx_models/
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Node / JS
+node_modules/
+package-lock.json
+
+# IDEs and Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+.agents/
+
+# System Files
+.DS_Store
+Thumbs.db
+
+# Project specific temp files
+*.txt
+!requirements.txt
+!README.txt
+!LICENSE.txt
