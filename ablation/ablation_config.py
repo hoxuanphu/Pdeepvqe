@@ -70,11 +70,15 @@ BASE_TRAIN_CONFIG = {
         "checkpoint_monitor": "loss",
         "checkpoint_mode": "min",
         "use_amp": True,
+        "use_gan": False,
+        "num_d_scales": 1,
     },
     "loss": {
         "lamda_ri": 30.0,
         "lamda_mag": 70.0,
         "compress_factor": 0.3,
+        "lamda_adv": 0.05,
+        "lambda_fm": 0.0,
     },
 }
 
