@@ -1,0 +1,17 @@
+experiment:
+  config_id: GAN_Baseline
+  output_dir: runs/ablation/GAN_Baseline
+model:
+  prelu_type:
+  dw_residual: false
+  use_eca_f: false
+  main_block_eca_f: false
+  skip_gate:
+  dw_subpixel: false
+  gru_hidden: 576
+training:
+  use_gan: true
+  num_d_scales: 1
+loss:
+  lamda_adv: 0.05
+  lambda_fm: 0.0
