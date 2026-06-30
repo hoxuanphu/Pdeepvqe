@@ -9,6 +9,8 @@ Mỗi Phase là một dự án nghiên cứu nhỏ lẻ, cần được cô lậ
 ## Phase 1: MetricGAN & Adversarial Training (Zero Inference Cost)
 **Mục tiêu:** Cải thiện đáng kể độ tự nhiên của giọng nói (Naturalness/Perceptual Quality), giảm hiện tượng méo tiếng (artifacts) khi xử lý nhiễu nặng, mà **không làm tăng bất kỳ phép tính (FLOPs/Params) nào khi Deploy**.
 
+**Ứng viên Generator ưu tiên hiện tại:** Dựa trên `result/bao_cao_danh_gia_model.md`, `D1b_gru768` là lựa chọn cân bằng tốt nhất: PESQ cao nhất, SI-SDR/STOI nằm trong nhóm đầu và RTF tốt nhất trong bảng summary. Vì vậy Phase 1 nên chạy trước với preset `GAN_D1b_gru768`: kiến trúc inference giữ nguyên `D1b_gru768`, Discriminator chỉ dùng khi train.
+
 **Các bước triển khai:**
 1. **Thiết kế Discriminator:**
    - Xây dựng một module `Discriminator` dùng mạng CNN 2D (tương tự PatchGAN hoặc kiến trúc discriminator của CMGAN).
@@ -65,6 +67,7 @@ Mỗi Phase là một dự án nghiên cứu nhỏ lẻ, cần được cô lậ
 > **Quy tắc Bất di bất dịch:** Chỉ thực hiện 1 Phase/Thay đổi tại một thời điểm. Việc gộp chung (ví dụ vừa thêm Mamba vừa train GAN) sẽ làm nhiễu kết quả nghiên cứu.
 
 * **Tuần 1:** Triển khai **Phase 1 (MetricGAN/Adversarial Loss)** trên file code hiện tại. Đây là "Low hanging fruit" mang lại kết quả cảm nhận tức thì. (Bạn chỉ cần duyệt để tôi bắt đầu code Discriminator).
+  - Lệnh ưu tiên sau khi có dữ liệu manifest: `python ablation/train_ablation.py --config-id GAN_D1b_gru768`.
 * **Tuần 2:** Thiết lập môi trường và module **Mamba (Phase 2)**. Viết script đo RTF riêng cho Mamba để đảm bảo tính khả thi trên Edge Devices trước khi train thực tế.
 * **Tuần 3:** Thay thế và so sánh **Decoupled Mask / Taylor Mask (Phase 3)** với CCM. So đo từng FLOPs một theo đúng tinh thần của roadmap Ablation cũ.
 

@@ -13,19 +13,19 @@ import numpy as np
 import torch
 
 from ablation.ablation_config import get_train_config, reproducibility_metadata
+from ablation.checkpoint_utils import (
+    apply_notebook_config,
+    extract_state_dict,
+    load_sidecar_config,
+    load_state_dict_flexible,
+    torch_load_checkpoint,
+)
 from ablation.deepvqe_ablation import (
     DeepVQE_Ablation,
     StreamDeepVQE_Ablation,
     StreamDeepVQE_AblationONNXWrapper,
     convert_ablation_to_stream,
     stream_sequence,
-)
-from ablation.eval_ablation_quality import (
-    apply_notebook_config,
-    extract_state_dict,
-    load_sidecar_config,
-    load_state_dict_flexible,
-    torch_load_checkpoint,
 )
 
 
@@ -69,7 +69,7 @@ def append_result(output_path, row):
     rows = [item for item in rows if item.get("config_id") != row["config_id"]]
     rows.append(row)
     with output_path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
 
@@ -79,6 +79,15 @@ def cache_feed(cache, cache_names):
         name: tensor.detach().cpu().numpy()
         for name, tensor in zip(cache_names, cache)
     }
+
+
+def stft_freq_bins(cfg):
+    n_fft = int(cfg.get("stft", {}).get("n_fft", 512))
+    return n_fft // 2 + 1
+
+
+def batch_dynamic_axes(names):
+    return {name: {0: "batch"} for name in names}
 
 
 def main():
@@ -93,8 +102,17 @@ def main():
     parser.add_argument("--max-abs-error", type=float, default=1e-4)
     args = parser.parse_args()
 
+    if args.frames < 1:
+        raise ValueError("--frames must be >= 1")
+
     device = torch.device(args.device)
     model, cfg = load_model(args.checkpoint, args.config_id, device)
+    checkpoint_config_id = cfg.get("experiment", {}).get("config_id", args.config_id)
+    if checkpoint_config_id != args.config_id:
+        raise ValueError(
+            "Checkpoint config_id does not match --config-id: "
+            f"checkpoint={checkpoint_config_id!r}, arg={args.config_id!r}"
+        )
     stream_model = StreamDeepVQE_Ablation(**cfg["model"]).eval().to(device)
     convert_ablation_to_stream(stream_model, model, strict=True)
     wrapper = StreamDeepVQE_AblationONNXWrapper(stream_model).eval().to(device)
@@ -103,8 +121,14 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     onnx_path = output_dir / f"{args.config_id}_stream.onnx"
     simple_path = output_dir / f"{args.config_id}_stream_simple.onnx"
-    dummy_frame = torch.randn(1, 257, 1, 2, device=device)
-    dummy_cache = stream_model.init_cache(1, 257, device=device)
+    freq_bins = stft_freq_bins(cfg)
+    if freq_bins != 257:
+        raise ValueError(
+            "This DeepVQE architecture expects n_fft=512 / 257 frequency bins; "
+            f"checkpoint config has {freq_bins} bins."
+        )
+    dummy_frame = torch.randn(1, freq_bins, 1, 2, device=device)
+    dummy_cache = stream_model.init_cache(1, freq_bins, device=device)
     cache_names = stream_model.get_cache_names()
     notes = []
     export_pass = False
@@ -114,6 +138,7 @@ def main():
 
     input_names = ["mix", *cache_names]
     output_names = ["enh", *[f"{name}_out" for name in cache_names]]
+    dynamic_axes = batch_dynamic_axes([*input_names, *output_names])
 
     try:
         torch.onnx.export(
@@ -122,6 +147,7 @@ def main():
             str(onnx_path),
             input_names=input_names,
             output_names=output_names,
+            dynamic_axes=dynamic_axes,
             opset_version=args.opset,
             verbose=False,
         )
@@ -151,16 +177,16 @@ def main():
             import onnxruntime
 
             session = onnxruntime.InferenceSession(str(run_path), None, providers=["CPUExecutionProvider"])
-            input_seq = torch.randn(1, 257, args.frames, 2, device=device)
+            input_seq = torch.randn(1, freq_bins, args.frames, 2, device=device)
             with torch.no_grad():
                 torch_stream, _ = stream_sequence(stream_model, input_seq)
 
-            ort_cache = stream_model.init_cache(1, 257, device=device)
+            ort_cache = stream_model.init_cache(1, freq_bins, device=device)
             ort_outputs = []
             input_np = input_seq.detach().cpu().numpy()
 
             for _ in range(3):
-                warm_cache = stream_model.init_cache(1, 257, device=device)
+                warm_cache = stream_model.init_cache(1, freq_bins, device=device)
                 for frame_idx in range(args.frames):
                     feed = {"mix": input_np[:, :, frame_idx : frame_idx + 1, :], **cache_feed(warm_cache, cache_names)}
                     values = session.run(output_names, feed)

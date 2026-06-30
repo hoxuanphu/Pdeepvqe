@@ -1,0 +1,24 @@
+experiment:
+  config_id: GAN_Mamba_b2_h384
+  output_dir: runs/ablation/GAN_Mamba_b2_h384
+model:
+  prelu_type:
+  dw_residual: false
+  use_eca_f: false
+  main_block_eca_f: false
+  skip_gate:
+  dw_subpixel: false
+  gru_hidden: 576
+  sequence_model: mamba
+  mamba_blocks: 2
+  mamba_hidden: 384
+  mamba_state: 16
+  mamba_conv: 4
+  mamba_expand: 2
+training:
+  use_gan: true
+  num_d_scales: 3
+loss:
+  lamda_adv: 0.05
+  lambda_fm: 2.0
+

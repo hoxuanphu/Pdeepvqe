@@ -1,67 +1,204 @@
-# DeepVQE
-A PyTorch implementation of DeepVQE described in [DeepVQE: Real Time Deep Voice Quality Enhancement for Joint Acoustic Echo Cancellation, Noise Suppression and Dereverberation](https://arxiv.org/pdf/2306.03177.pdf).
+# DeepVQE Ablation Workspace
 
-Pre-trained checkpoint can be found here: [deepvqe_trained_on_DNS3.tar](https://drive.google.com/file/d/1pyX0mfQ5HWfpIC45hnImsBvjElo33EXn/view?usp=drive_link). Usage:
-```
-import soundfile as sf
+This repository is a DeepVQE research workspace focused on speech enhancement, architecture ablation, streaming deployment checks, and Phase 1 adversarial training.
 
-model = DeepVQE().cuda()
-checkpoint = torch.load('deepvqe_trained_on_DNS3.tar')
-model.load_state_dict(checkpoint['model'])
+The original DeepVQE implementation is based on the paper [DeepVQE: Real Time Deep Voice Quality Enhancement for Joint Acoustic Echo Cancellation, Noise Suppression and Dereverberation](https://arxiv.org/pdf/2306.03177.pdf). In this project, the active scope is noise suppression / speech enhancement with the NS-only ablation model family.
 
-x, fs = sf.read('test.wav', dtype='float32')  # x: (n_samples,), single channel, 16 kHz
-x = torch.from_numpy(x).unsqueeze(0)  # (B=1, n_samples)
+## Current Status
 
-orig_len = x.shape[-1]
-x = torch.stft(x, 512, 256, 512, torch.hann_window(512), return_complex=True)
-x = torch.view_as_real(x)  # (B=1,F=257,T,2)
+The latest local evaluation summary is in [result/bao_cao_danh_gia_model.md](result/bao_cao_danh_gia_model.md).
 
-with torch.no_grad():
-    y = model(x)  # (B=1,F=257,T,2)
-y = torch.complex(y[...,0], y[...,1])
-y = torch.istft(y, 512, 256, 512, torch.hann_window(512))  # (B, n_samples)
+Best current generator:
 
-y = torch.nn.functional.pad(y, [0, orig_len-y.shape[-1]])
-```
+| Category | Selected model | Reason |
+| --- | --- | --- |
+| Best overall | `D1b_gru768` | Highest PESQ, SI-SDR/STOI in the leading group, and best RTF in the current summary. |
+| Best PESQ | `D1b_gru768` | PESQ enhanced `2.8736`. |
+| Best STOI / SI-SDR | `B4` | Highest STOI and SI-SDR, but lower PESQ than `D1b_gru768`. |
+| Do not use | `B1a` | All main quality metrics degrade strongly. |
 
-## About DeepVQE
-![DeepVQE](https://github.com/Xiaobin-Rong/deepvqe/blob/main/pictures/DeepVQE.PNG)
-DeepVQE is a speech enhancement (SE) model proposed by Microsoft for joint echo cancellation, noise suppression and dereverberation, which outperforms the top 1 models in both 2023 DNS Challenge and 2023 AEC Challenge.
+The recommended next experiment is `GAN_D1b_gru768`: train-only GAN loss on top of the `D1b_gru768` generator. The discriminator is not used during inference, so deploy-time architecture and RTF remain those of `D1b_gru768`.
 
-DeepVQE utilizes the U-Net architecture as backbone, while makes some improvements:
-* A new cross-attention mechanism for the microphone and far end soft alignment.
-* Add residual block for each block in encoder and decoder.
-* Use sub-pixel convolution instead of transposed convolution for up-sampling.
-* A novel mask mechanism named complex convolving mask (CCM).
+## Repository Layout
 
-**About the differences of `deepvqe.py` and `deepvqe_v1.py`**: The only difference between the two lies in the implementation of the CCM module, where `deepvqe.py` utilizes real number multiplication exclusively, while `deepvqe_v1.py` uses complex number multiplication. It is believed that these two different implementation methods will not have any impact on the results. Personally, a preference is leaned towards the use of real number multiplication due to its greater compatibility with multiple platforms.
-
-## Our purpose
-We implement DeepVQE aiming to compare its SE performance with other two SOTA SE models, [DPCRN](https://arxiv.org/pdf/2107.05429.pdf) and [TF-GridNet](https://arxiv.org/pdf/2211.12433.pdf). To this end, We modify some experimental setup in the original paper, specifically:
-* Datasets: we use DNS3 datasets in which all the utterances are sampled at 16 kHz.
-* STFT: we use a squared root Hann window of length 32 ms, a hop length of 16 ms, and an FFT length of 512.
-* Align Block: we drop the Align Block, because we do not focus on its AEC performance. Anyway, we still provide an implementation of the Align Block in our codes.
-
-We are also interested in the inference speed presented in the paper, i.e, a relatively fast speed of 3.66 ms per frame in spite of its large complexity. So we also provide a stream version of DeepVQE, which is utilized to evaluate its inference speed.
+| Path | Purpose |
+| --- | --- |
+| [deepvqe.py](deepvqe.py) | Original/offline DeepVQE model implementation. |
+| [stream/](stream) | Stateful streaming model and streaming modules. |
+| [ablation/deepvqe_ablation.py](ablation/deepvqe_ablation.py) | Parameterized ablation model variants. |
+| [ablation/ablation_config.py](ablation/ablation_config.py) | Training defaults and train presets such as `GAN_D1b_gru768`. |
+| [ablation/discriminator.py](ablation/discriminator.py) | PatchGAN / multi-scale discriminator and GAN losses. |
+| [ablation/train_ablation.py](ablation/train_ablation.py) | CLI training script for ablation variants. |
+| [ablation/eval_ablation_quality.py](ablation/eval_ablation_quality.py) | PESQ/STOI/SI-SDR evaluation script. |
+| [ablation/run_ablation_benchmark.py](ablation/run_ablation_benchmark.py) | Params, MACs/FLOPs, causality, streaming parity, and RTF benchmark. |
+| [ablation/export_ablation_onnx.py](ablation/export_ablation_onnx.py) | Streaming ONNX export and parity check. |
+| [ablation/docs/](ablation/docs) | Roadmaps, training plans, and review notes. |
+| [result/](result) | Local evaluation artifacts and model comparison report. |
 
 ## Requirements
-einops <br/>
-numpy<br/>
-onnx<br/>
-onnxruntime<br/>
-onnxsim<br/>
-ptflops<br/>
-torch==1.11.0<br/>
 
-## Results
-### 1. SE performance
-We are sorry to find that DeepVQE outperforms DPCRN only with a very limited margin, while requirng for much more computational resources (see below). Besides, DeepVQE lags behind TF-GridNet by a relatively large margin in terms of SE performance.
-| Model    | Param. (M)| FLOPs (G) | OVRL / SIG/ BAK | DNSMOS-P.808 |
-|:--------:|:---------:|:---------:|:---------------:|:------------:|
-|DPCRN     |0.81       |3.73       |2.88 / 3.14 / 4/02|3.56         |
-|TF-GridNet|1.60       |22.23      |2.98 / 3.25 / 4/05|3.65         |
-|DeepVQE   |7.51       |8.04       |2.89 / 3.16 / 4.02|3.59         |
+The pinned dependencies are listed in [requirements.txt](requirements.txt).
 
+```bash
+pip install -r requirements.txt
+```
 
-### 2. Inference speed 
-We are surprised to find that although DeepVQE requires for large computational resources, it achieves a relatively good real-time factor of 0.2, which corresponds to the data presented in the paper. 
+For quality evaluation, install the optional metric packages used by notebooks/scripts when needed:
+
+```bash
+pip install pesq pystoi torchmetrics pandas tqdm pyyaml
+```
+
+Note: this workspace is often trained on Kaggle/Colab. The local machine used for repository edits may not have PyTorch installed.
+
+## Main Config IDs
+
+Architecture configs are defined in [ablation/deepvqe_ablation.py](ablation/deepvqe_ablation.py).
+
+| Config | Meaning |
+| --- | --- |
+| `Baseline` | Original ablation-compatible DeepVQE baseline. |
+| `D1b_gru768` | Baseline with bottleneck GRU hidden size increased from 576 to 768. Current best overall generator. |
+| `B1b` | Per-channel PReLU activation variant. |
+| `B2` | ECA-F attention in residual blocks. |
+| `B3b` | Frequency SE skip gating. |
+| `B4` | Loss-focused run that leads STOI/SI-SDR in the current report. |
+| `C1a-g2` | Grouped residual convolution legacy variant. |
+
+Training presets are defined in [ablation/ablation_config.py](ablation/ablation_config.py).
+
+| Preset | Base architecture | Training change |
+| --- | --- | --- |
+| `GAN_Baseline` | `Baseline` | Single-scale GAN loss. |
+| `GAN_MSD3` | `Baseline` | Multi-scale discriminator, 3 scales, feature matching. |
+| `GAN_D1b_gru768` | `D1b_gru768` | Recommended Phase 1 GAN run: 3-scale discriminator and feature matching. |
+
+## Kaggle Notebook
+
+Use this notebook for the current recommended run:
+
+[train_phase1_gan_d1b_gru768_deepvqe_kaggle_v1.ipynb](train_phase1_gan_d1b_gru768_deepvqe_kaggle_v1.ipynb)
+
+Key settings inside the notebook:
+
+```python
+CONFIG = {
+    "config_id": "D1b_gru768",
+    "result_config_id": "GAN_D1b_gru768",
+    "run_name": "phase1_gan_d1b_gru768_v1",
+    "num_d_scales": 3,
+    "lambda_fm": 2.0,
+}
+```
+
+The notebook currently uses one GPU by default. WandB run name is controlled by `CONFIG["run_name"]`, and WandB only starts when `CONFIG["use_wandb"] = True`.
+
+## Training
+
+Train the current recommended preset:
+
+```bash
+python ablation/train_ablation.py --config-id GAN_D1b_gru768
+```
+
+Train a plain architecture config:
+
+```bash
+python ablation/train_ablation.py --config-id D1b_gru768
+```
+
+Override manifests and device:
+
+```bash
+python ablation/train_ablation.py \
+  --config-id GAN_D1b_gru768 \
+  --train-manifest data/manifests/train.jsonl \
+  --valid-manifest data/manifests/valid.jsonl \
+  --device cuda \
+  --epochs 80 \
+  --batch-size 8
+```
+
+Use a YAML override:
+
+```bash
+python ablation/train_ablation.py \
+  --config-id D1b_gru768 \
+  --config-yaml ablation/configs/GAN_D1b_gru768.yaml
+```
+
+## Evaluation
+
+Evaluate a trained checkpoint:
+
+```bash
+python ablation/eval_ablation_quality.py \
+  --config-id GAN_D1b_gru768 \
+  --checkpoint runs/ablation/GAN_D1b_gru768/best.pt \
+  --manifest data/manifests/test.jsonl \
+  --output results/ablation_quality.csv \
+  --device cuda
+```
+
+Run architecture and streaming benchmark:
+
+```bash
+python ablation/run_ablation_benchmark.py \
+  --configs GAN_D1b_gru768 \
+  --device cuda \
+  --output results/ablation_arch_benchmark.csv
+```
+
+Verify streaming parity:
+
+```bash
+python ablation/test_ablation_streaming.py --configs GAN_D1b_gru768
+```
+
+Export streaming ONNX:
+
+```bash
+python ablation/export_ablation_onnx.py \
+  --config-id GAN_D1b_gru768 \
+  --checkpoint runs/ablation/GAN_D1b_gru768/best.pt \
+  --output-dir onnx_models/ablation \
+  --results results/ablation_onnx.csv \
+  --device cpu
+```
+
+Collect result CSVs:
+
+```bash
+python ablation/collect_ablation_results.py
+```
+
+## Inference
+
+Run WAV inference with a checkpoint:
+
+```bash
+python infer.py \
+  --input input.wav \
+  --output enhanced.wav \
+  --ckpt deepvqe_trained_on_DNS3.tar \
+  --device cuda
+```
+
+The ablation scripts operate on STFT tensors internally with:
+
+| STFT setting | Value |
+| --- | --- |
+| Sample rate | 16 kHz |
+| `n_fft` | 512 |
+| `win_length` | 512 |
+| `hop_length` | 256 |
+| Window | `sqrt_hann` for ablation training |
+
+## Notes For Future Experiments
+
+- Keep architecture ablations and training-objective ablations separate when comparing results.
+- `GAN_D1b_gru768` changes training only; inference should be benchmarked as `D1b_gru768`.
+- Compare RTF only on the same hardware/device type.
+- Keep a fixed test manifest for all reported PESQ/STOI/SI-SDR comparisons.
+- Do not promote a variant based on one metric alone; use PESQ, STOI, SI-SDR, listening checks, and RTF together.
+

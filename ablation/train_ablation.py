@@ -17,7 +17,6 @@ if __package__ in (None, ""):
 
 import numpy as np
 import torch
-import torchaudio
 from torch.utils.data import DataLoader, Dataset
 
 try:
@@ -125,6 +124,8 @@ def resolve_path(value, record, data_root=None):
 
 
 def load_audio(path, sample_rate):
+    import torchaudio
+
     wav, sr = torchaudio.load(str(path))
     wav = wav.float()
     if wav.shape[0] > 1:

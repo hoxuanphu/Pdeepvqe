@@ -11,6 +11,7 @@ import sys
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from ablation.ablation_config import get_model_config_id
 from ablation.deepvqe_ablation import (
     DeepVQE_Ablation,
     StreamDeepVQE_Ablation,
@@ -64,8 +65,9 @@ def main():
     print(f"Audio loaded: {audio_seconds:.2f} seconds -> {frames} frames.")
 
     # 3. Load Model & Convert to Streaming
-    print(f"Loading {args.config} model...")
-    offline_model = DeepVQE_Ablation.from_config_id(args.config).eval().to(device)
+    model_config_id = get_model_config_id(args.config)
+    print(f"Loading {args.config} model (architecture={model_config_id})...")
+    offline_model = DeepVQE_Ablation.from_config_id(model_config_id).eval().to(device)
     
     # Load weights if checkpoint is provided
     if args.checkpoint:
@@ -76,7 +78,7 @@ def main():
         # Cho phép strict=False vì có thể có các biến thể thay đổi cấu trúc nhẹ so với config
         offline_model.load_state_dict(state_dict, strict=False)
 
-    stream_model = StreamDeepVQE_Ablation.from_config_id(args.config).eval().to(device)
+    stream_model = StreamDeepVQE_Ablation.from_config_id(model_config_id).eval().to(device)
     convert_ablation_to_stream(stream_model, offline_model, strict=True)
 
     # 4. Warm-up (Khởi tạo CUDA kernels)

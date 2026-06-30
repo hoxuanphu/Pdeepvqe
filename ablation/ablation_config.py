@@ -5,9 +5,6 @@ import os
 import platform
 import subprocess
 
-import torch
-
-
 BASE_TRAIN_CONFIG = {
     "experiment": {
         "name": "deepvqe_ablation",
@@ -24,6 +21,12 @@ BASE_TRAIN_CONFIG = {
         "skip_gate": None,
         "dw_subpixel": False,
         "gru_hidden": 576,
+        "sequence_model": "gru",
+        "mamba_blocks": 2,
+        "mamba_hidden": None,
+        "mamba_state": 16,
+        "mamba_conv": 4,
+        "mamba_expand": 2,
     },
     "stft": {
         "n_fft": 512,
@@ -83,6 +86,54 @@ BASE_TRAIN_CONFIG = {
 }
 
 
+TRAIN_CONFIG_PRESETS = {
+    "GAN_Baseline": {
+        "base_config_id": "Baseline",
+        "training": {
+            "use_gan": True,
+            "num_d_scales": 1,
+        },
+        "loss": {
+            "lamda_adv": 0.05,
+            "lambda_fm": 0.0,
+        },
+    },
+    "GAN_MSD3": {
+        "base_config_id": "Baseline",
+        "training": {
+            "use_gan": True,
+            "num_d_scales": 3,
+        },
+        "loss": {
+            "lamda_adv": 0.05,
+            "lambda_fm": 2.0,
+        },
+    },
+    "GAN_D1b_gru768": {
+        "base_config_id": "D1b_gru768",
+        "training": {
+            "use_gan": True,
+            "num_d_scales": 3,
+        },
+        "loss": {
+            "lamda_adv": 0.05,
+            "lambda_fm": 2.0,
+        },
+    },
+    "GAN_Mamba_b2_h384": {
+        "base_config_id": "Mamba_b2_h384",
+        "training": {
+            "use_gan": True,
+            "num_d_scales": 3,
+        },
+        "loss": {
+            "lamda_adv": 0.05,
+            "lambda_fm": 2.0,
+        },
+    },
+}
+
+
 def deep_update(base, override):
     result = deepcopy(base)
     for key, value in override.items():
@@ -93,14 +144,27 @@ def deep_update(base, override):
     return result
 
 
+def get_model_config_id(config_id):
+    """Return the architecture config used by a train config or preset."""
+    preset = TRAIN_CONFIG_PRESETS.get(config_id)
+    if preset is None:
+        return config_id
+    return preset["base_config_id"]
+
+
 def get_train_config(config_id="Baseline"):
     from ablation.deepvqe_ablation import get_ablation_config
 
+    model_config_id = get_model_config_id(config_id)
     cfg = deepcopy(BASE_TRAIN_CONFIG)
     cfg["experiment"]["config_id"] = config_id
     cfg["experiment"]["name"] = f"deepvqe_ablation_{config_id}"
     cfg["experiment"]["output_dir"] = f"runs/ablation/{config_id}"
-    cfg["model"] = get_ablation_config(config_id)
+    cfg["model"] = get_ablation_config(model_config_id)
+    preset = TRAIN_CONFIG_PRESETS.get(config_id)
+    if preset is not None:
+        preset_override = {key: value for key, value in preset.items() if key != "base_config_id"}
+        cfg = deep_update(cfg, preset_override)
     return cfg
 
 
@@ -121,6 +185,17 @@ def git_commit():
 
 
 def hardware_info():
+    try:
+        import torch
+    except ImportError:
+        return {
+            "platform": platform.platform(),
+            "processor": platform.processor(),
+            "cpu_count": os.cpu_count(),
+            "cuda_available": False,
+            "cuda_device": "",
+        }
+
     cuda_name = ""
     if torch.cuda.is_available():
         try:
@@ -138,6 +213,14 @@ def hardware_info():
 
 def reproducibility_metadata(cfg=None, checkpoint_id=""):
     try:
+        import torch
+        torch_version = torch.__version__
+        num_threads = torch.get_num_threads()
+    except ImportError:
+        torch_version = ""
+        num_threads = ""
+
+    try:
         import onnxruntime
 
         ort_version = onnxruntime.__version__
@@ -149,8 +232,8 @@ def reproducibility_metadata(cfg=None, checkpoint_id=""):
         "config_hash": stable_config_hash(cfg) if cfg is not None else "",
         "seed": cfg.get("experiment", {}).get("seed", "") if cfg is not None else "",
         "hardware_info": json.dumps(hardware_info(), sort_keys=True),
-        "torch_version": torch.__version__,
+        "torch_version": torch_version,
         "onnxruntime_version": ort_version,
-        "num_threads": torch.get_num_threads(),
+        "num_threads": num_threads,
         "checkpoint_id": checkpoint_id,
     }

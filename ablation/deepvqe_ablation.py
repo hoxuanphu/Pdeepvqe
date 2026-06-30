@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from einops import rearrange
 
 from deepvqe import CCM, FE, SubpixelConv2d
+from ablation.modules.mamba import MambaStack
 from stream.modules.convolution import StreamConv2d
 
 
@@ -56,6 +57,21 @@ ABLATION_CONFIGS = {
         "gru_hidden": BASE_GRU_HIDDEN,
         "temporal_refine": True,
         "temporal_refine_kernel": 3,
+    },
+    "Mamba_b2_h384": {
+        "prelu_type": None,
+        "dw_residual": False,
+        "use_eca_f": False,
+        "main_block_eca_f": False,
+        "skip_gate": None,
+        "dw_subpixel": False,
+        "gru_hidden": BASE_GRU_HIDDEN,
+        "sequence_model": "mamba",
+        "mamba_blocks": 2,
+        "mamba_hidden": 384,
+        "mamba_state": 16,
+        "mamba_conv": 4,
+        "mamba_expand": 2,
     },
     "B1a": {
         "prelu_type": "shared",
@@ -250,6 +266,12 @@ def _normalize_model_config(config):
     cfg.setdefault("dw_subpixel", False)
     cfg.setdefault("temporal_refine", False)
     cfg.setdefault("temporal_refine_kernel", 3)
+    cfg.setdefault("sequence_model", "gru")
+    cfg.setdefault("mamba_blocks", 2)
+    cfg.setdefault("mamba_hidden", None)
+    cfg.setdefault("mamba_state", 16)
+    cfg.setdefault("mamba_conv", 4)
+    cfg.setdefault("mamba_expand", 2)
 
     if cfg["skip_gate"] in ("none", "identity", False):
         cfg["skip_gate"] = None
@@ -257,6 +279,19 @@ def _normalize_model_config(config):
         cfg["skip_gate"] = "se_f"
     if cfg["skip_gate"] not in (None, "eca_f", "se_f"):
         raise ValueError("skip_gate must be None, 'eca_f', or 'se_f'")
+
+    if cfg["sequence_model"] in (None, "rnn"):
+        cfg["sequence_model"] = "gru"
+    if cfg["sequence_model"] not in ("gru", "mamba"):
+        raise ValueError("sequence_model must be 'gru' or 'mamba'")
+    cfg["mamba_blocks"] = int(cfg["mamba_blocks"])
+    cfg["mamba_state"] = int(cfg["mamba_state"])
+    cfg["mamba_conv"] = int(cfg["mamba_conv"])
+    cfg["mamba_expand"] = int(cfg["mamba_expand"])
+    if cfg["mamba_hidden"] is not None:
+        cfg["mamba_hidden"] = int(cfg["mamba_hidden"])
+    if cfg["sequence_model"] != "gru" and cfg["temporal_refine"]:
+        raise ValueError("temporal_refine is currently only supported with sequence_model='gru'")
 
     allowed = {
         "prelu_type",
@@ -269,6 +304,12 @@ def _normalize_model_config(config):
         "dw_subpixel",
         "temporal_refine",
         "temporal_refine_kernel",
+        "sequence_model",
+        "mamba_blocks",
+        "mamba_hidden",
+        "mamba_state",
+        "mamba_conv",
+        "mamba_expand",
     }
     unknown = sorted(set(cfg) - allowed)
     if unknown:
@@ -518,6 +559,35 @@ class Bottleneck_Ablation(nn.Module):
         return y
 
 
+class MambaBottleneck_Ablation(nn.Module):
+    def __init__(
+        self,
+        input_size,
+        num_blocks=2,
+        hidden_size=None,
+        d_state=16,
+        d_conv=4,
+        expand=2,
+    ):
+        super().__init__()
+        self.input_size = int(input_size)
+        self.stack = MambaStack(
+            self.input_size,
+            num_blocks=num_blocks,
+            hidden_size=hidden_size,
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand,
+        )
+
+    def forward(self, x):
+        """x: (B, C, T, F)."""
+        y = rearrange(x, "b c t f -> b t (c f)")
+        y, _ = self.stack(y)
+        y = rearrange(y, "b t (c f) -> b c t f", c=x.shape[1])
+        return y
+
+
 class DecoderBlock_Ablation(nn.Module):
     def __init__(
         self,
@@ -573,6 +643,12 @@ class DeepVQE_Ablation(nn.Module):
         dw_subpixel=False,
         temporal_refine=False,
         temporal_refine_kernel=3,
+        sequence_model="gru",
+        mamba_blocks=2,
+        mamba_hidden=None,
+        mamba_state=16,
+        mamba_conv=4,
+        mamba_expand=2,
         **legacy_kwargs,
     ):
         super().__init__()
@@ -587,6 +663,12 @@ class DeepVQE_Ablation(nn.Module):
                 "dw_subpixel": dw_subpixel,
                 "temporal_refine": temporal_refine,
                 "temporal_refine_kernel": temporal_refine_kernel,
+                "sequence_model": sequence_model,
+                "mamba_blocks": mamba_blocks,
+                "mamba_hidden": mamba_hidden,
+                "mamba_state": mamba_state,
+                "mamba_conv": mamba_conv,
+                "mamba_expand": mamba_expand,
                 **legacy_kwargs,
             }
         )
@@ -612,12 +694,22 @@ class DeepVQE_Ablation(nn.Module):
         self.enblock4 = EncoderBlock_Ablation(128, 128, **block_kwargs)
         self.enblock5 = EncoderBlock_Ablation(128, 128, **block_kwargs)
 
-        self.bottle = Bottleneck_Ablation(
-            128 * 9,
-            int(cfg["gru_hidden"]),
-            temporal_refine=cfg["temporal_refine"],
-            temporal_refine_kernel=cfg["temporal_refine_kernel"],
-        )
+        if cfg["sequence_model"] == "mamba":
+            self.bottle = MambaBottleneck_Ablation(
+                128 * 9,
+                num_blocks=cfg["mamba_blocks"],
+                hidden_size=cfg["mamba_hidden"],
+                d_state=cfg["mamba_state"],
+                d_conv=cfg["mamba_conv"],
+                expand=cfg["mamba_expand"],
+            )
+        else:
+            self.bottle = Bottleneck_Ablation(
+                128 * 9,
+                int(cfg["gru_hidden"]),
+                temporal_refine=cfg["temporal_refine"],
+                temporal_refine_kernel=cfg["temporal_refine_kernel"],
+            )
 
         self.deblock5 = DecoderBlock_Ablation(128, 128, **decoder_kwargs)
         self.deblock4 = DecoderBlock_Ablation(128, 128, **decoder_kwargs)
@@ -781,6 +873,44 @@ class StreamBottleneck_Ablation(nn.Module):
         return y, cache, refine_cache
 
 
+class StreamMambaBottleneck_Ablation(nn.Module):
+    def __init__(
+        self,
+        input_size,
+        num_blocks=2,
+        hidden_size=None,
+        d_state=16,
+        d_conv=4,
+        expand=2,
+    ):
+        super().__init__()
+        self.input_size = int(input_size)
+        self.refine = None
+        self.stack = MambaStack(
+            self.input_size,
+            num_blocks=num_blocks,
+            hidden_size=hidden_size,
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand,
+        )
+
+    def cache_names(self):
+        return self.stack.cache_names("mamba")
+
+    def init_cache(self, batch_size, device=None, dtype=None):
+        return list(self.stack.init_cache(batch_size, device=device, dtype=dtype))
+
+    def forward(self, x, cache, refine_cache=None):
+        """x: (B, C, 1, F), cache: flat Mamba cache list."""
+        y = rearrange(x, "b c t f -> b t (c f)")
+        if y.shape[1] != 1:
+            raise ValueError("StreamMambaBottleneck_Ablation expects one frame at a time")
+        y, cache = self.stack.step(y[:, 0], tuple(cache))
+        y = rearrange(y.unsqueeze(1), "b t (c f) -> b c t f", f=x.shape[-1])
+        return y, list(cache), refine_cache
+
+
 class StreamSubpixelConv2d_Ablation(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=(4, 3)):
         super().__init__()
@@ -905,7 +1035,7 @@ class StreamCCM_Ablation(nn.Module):
 class StreamDeepVQE_Ablation(nn.Module):
     """Stateful streaming counterpart for every ``DeepVQE_Ablation`` variant."""
 
-    cache_names = (
+    cache_prefix_names = (
         "en_conv_cache1",
         "en_res_cache1",
         "en_conv_cache2",
@@ -916,7 +1046,8 @@ class StreamDeepVQE_Ablation(nn.Module):
         "en_res_cache4",
         "en_conv_cache5",
         "en_res_cache5",
-        "h_cache",
+    )
+    cache_suffix_names = (
         "de_conv_cache5",
         "de_res_cache5",
         "de_conv_cache4",
@@ -931,9 +1062,15 @@ class StreamDeepVQE_Ablation(nn.Module):
     )
 
     def get_cache_names(self):
-        if getattr(self.bottle, "refine", None) is None:
-            return self.cache_names
-        return self.cache_names[:11] + ("temporal_refine_cache",) + self.cache_names[11:]
+        bottle_names = (
+            self.bottle.cache_names()
+            if hasattr(self.bottle, "cache_names")
+            else ("h_cache",)
+        )
+        names = self.cache_prefix_names + tuple(bottle_names)
+        if getattr(self.bottle, "refine", None) is not None:
+            names = names + ("temporal_refine_cache",)
+        return names + self.cache_suffix_names
 
     def __init__(
         self,
@@ -946,6 +1083,12 @@ class StreamDeepVQE_Ablation(nn.Module):
         dw_subpixel=False,
         temporal_refine=False,
         temporal_refine_kernel=3,
+        sequence_model="gru",
+        mamba_blocks=2,
+        mamba_hidden=None,
+        mamba_state=16,
+        mamba_conv=4,
+        mamba_expand=2,
         **legacy_kwargs,
     ):
         super().__init__()
@@ -960,6 +1103,12 @@ class StreamDeepVQE_Ablation(nn.Module):
                 "dw_subpixel": dw_subpixel,
                 "temporal_refine": temporal_refine,
                 "temporal_refine_kernel": temporal_refine_kernel,
+                "sequence_model": sequence_model,
+                "mamba_blocks": mamba_blocks,
+                "mamba_hidden": mamba_hidden,
+                "mamba_state": mamba_state,
+                "mamba_conv": mamba_conv,
+                "mamba_expand": mamba_expand,
                 **legacy_kwargs,
             }
         )
@@ -985,12 +1134,22 @@ class StreamDeepVQE_Ablation(nn.Module):
         self.enblock4 = StreamEncoderBlock_Ablation(128, 128, **block_kwargs)
         self.enblock5 = StreamEncoderBlock_Ablation(128, 128, **block_kwargs)
 
-        self.bottle = StreamBottleneck_Ablation(
-            128 * 9,
-            int(cfg["gru_hidden"]),
-            temporal_refine=cfg["temporal_refine"],
-            temporal_refine_kernel=cfg["temporal_refine_kernel"],
-        )
+        if cfg["sequence_model"] == "mamba":
+            self.bottle = StreamMambaBottleneck_Ablation(
+                128 * 9,
+                num_blocks=cfg["mamba_blocks"],
+                hidden_size=cfg["mamba_hidden"],
+                d_state=cfg["mamba_state"],
+                d_conv=cfg["mamba_conv"],
+                expand=cfg["mamba_expand"],
+            )
+        else:
+            self.bottle = StreamBottleneck_Ablation(
+                128 * 9,
+                int(cfg["gru_hidden"]),
+                temporal_refine=cfg["temporal_refine"],
+                temporal_refine_kernel=cfg["temporal_refine_kernel"],
+            )
 
         self.deblock5 = StreamDecoderBlock_Ablation(128, 128, **decoder_kwargs)
         self.deblock4 = StreamDecoderBlock_Ablation(128, 128, **decoder_kwargs)
@@ -1024,7 +1183,11 @@ class StreamDeepVQE_Ablation(nn.Module):
         f3 = (f2 + 1) // 2
         f4 = (f3 + 1) // 2
         f5 = (f4 + 1) // 2
-        hidden = self.bottle.gru.hidden_size
+        if hasattr(self.bottle, "init_cache"):
+            bottle_cache = self.bottle.init_cache(b, device=device, dtype=dtype)
+        else:
+            hidden = self.bottle.gru.hidden_size
+            bottle_cache = [torch.zeros(1, b, hidden, device=device, dtype=dtype)]
 
         cache = [
             torch.zeros(b, 2, 3, f0, device=device, dtype=dtype),
@@ -1037,7 +1200,7 @@ class StreamDeepVQE_Ablation(nn.Module):
             torch.zeros(b, 128, 3, f4, device=device, dtype=dtype),
             torch.zeros(b, 128, 3, f4, device=device, dtype=dtype),
             torch.zeros(b, 128, 3, f5, device=device, dtype=dtype),
-            torch.zeros(1, b, hidden, device=device, dtype=dtype),
+            *bottle_cache,
             torch.zeros(b, 128, 3, f5, device=device, dtype=dtype),
             torch.zeros(b, 128, 3, f5, device=device, dtype=dtype),
             torch.zeros(b, 128, 3, f4, device=device, dtype=dtype),
@@ -1058,7 +1221,7 @@ class StreamDeepVQE_Ablation(nn.Module):
                 device=device,
                 dtype=dtype,
             )
-            cache.insert(11, refine_cache)
+            cache.insert(len(self.cache_prefix_names) + len(bottle_cache), refine_cache)
         return cache
 
     def forward(self, x, cache):
@@ -1070,58 +1233,40 @@ class StreamDeepVQE_Ablation(nn.Module):
         if len(cache) != len(cache_names):
             raise ValueError(f"Expected {len(cache_names)} cache tensors, got {len(cache)}")
 
+        prefix_len = len(self.cache_prefix_names)
+        bottle_len = len(self.bottle.cache_names()) if hasattr(self.bottle, "cache_names") else 1
+        (
+            en_conv_cache1,
+            en_res_cache1,
+            en_conv_cache2,
+            en_res_cache2,
+            en_conv_cache3,
+            en_res_cache3,
+            en_conv_cache4,
+            en_res_cache4,
+            en_conv_cache5,
+            en_res_cache5,
+        ) = cache[:prefix_len]
+        bottle_cache = list(cache[prefix_len : prefix_len + bottle_len])
+        idx = prefix_len + bottle_len
         if self.bottle.refine is not None:
-            (
-                en_conv_cache1,
-                en_res_cache1,
-                en_conv_cache2,
-                en_res_cache2,
-                en_conv_cache3,
-                en_res_cache3,
-                en_conv_cache4,
-                en_res_cache4,
-                en_conv_cache5,
-                en_res_cache5,
-                h_cache,
-                temporal_refine_cache,
-                de_conv_cache5,
-                de_res_cache5,
-                de_conv_cache4,
-                de_res_cache4,
-                de_conv_cache3,
-                de_res_cache3,
-                de_conv_cache2,
-                de_res_cache2,
-                de_conv_cache1,
-                de_res_cache1,
-                m_cache,
-            ) = cache
+            temporal_refine_cache = cache[idx]
+            idx += 1
         else:
             temporal_refine_cache = None
-            (
-                en_conv_cache1,
-                en_res_cache1,
-                en_conv_cache2,
-                en_res_cache2,
-                en_conv_cache3,
-                en_res_cache3,
-                en_conv_cache4,
-                en_res_cache4,
-                en_conv_cache5,
-                en_res_cache5,
-                h_cache,
-                de_conv_cache5,
-                de_res_cache5,
-                de_conv_cache4,
-                de_res_cache4,
-                de_conv_cache3,
-                de_res_cache3,
-                de_conv_cache2,
-                de_res_cache2,
-                de_conv_cache1,
-                de_res_cache1,
-                m_cache,
-            ) = cache
+        (
+            de_conv_cache5,
+            de_res_cache5,
+            de_conv_cache4,
+            de_res_cache4,
+            de_conv_cache3,
+            de_res_cache3,
+            de_conv_cache2,
+            de_res_cache2,
+            de_conv_cache1,
+            de_res_cache1,
+            m_cache,
+        ) = cache[idx:]
 
         en_x0 = self.fe(x)
         en_x1, en_conv_cache1, en_res_cache1 = self.enblock1(en_x0, en_conv_cache1, en_res_cache1)
@@ -1130,7 +1275,10 @@ class StreamDeepVQE_Ablation(nn.Module):
         en_x4, en_conv_cache4, en_res_cache4 = self.enblock4(en_x3, en_conv_cache4, en_res_cache4)
         en_x5, en_conv_cache5, en_res_cache5 = self.enblock5(en_x4, en_conv_cache5, en_res_cache5)
 
-        en_xr, h_cache, temporal_refine_cache = self.bottle(en_x5, h_cache, temporal_refine_cache)
+        bottle_arg = bottle_cache if hasattr(self.bottle, "cache_names") else bottle_cache[0]
+        en_xr, bottle_cache, temporal_refine_cache = self.bottle(en_x5, bottle_arg, temporal_refine_cache)
+        if not isinstance(bottle_cache, (list, tuple)):
+            bottle_cache = [bottle_cache]
 
         de_x5, de_conv_cache5, de_res_cache5 = self.deblock5(en_xr, en_x5, de_conv_cache5, de_res_cache5)
         de_x5 = de_x5[..., : en_x4.shape[-1]]
@@ -1156,7 +1304,7 @@ class StreamDeepVQE_Ablation(nn.Module):
             en_res_cache4,
             en_conv_cache5,
             en_res_cache5,
-            h_cache,
+            *bottle_cache,
         ]
         if self.bottle.refine is not None:
             new_cache.append(temporal_refine_cache)

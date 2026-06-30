@@ -15,6 +15,7 @@ if __package__ in (None, ""):
 import numpy as np
 import torch
 
+from ablation.ablation_config import get_model_config_id
 from ablation.deepvqe_ablation import (
     ABLATION_CONFIGS,
     DeepVQE_Ablation,
@@ -42,8 +43,9 @@ def main():
 
     seed_everything(args.seed)
     for config_id in args.configs:
-        offline = DeepVQE_Ablation.from_config_id(config_id).eval()
-        stream = StreamDeepVQE_Ablation.from_config_id(config_id).eval()
+        model_config_id = get_model_config_id(config_id)
+        offline = DeepVQE_Ablation.from_config_id(model_config_id).eval()
+        stream = StreamDeepVQE_Ablation.from_config_id(model_config_id).eval()
         convert_ablation_to_stream(stream, offline, strict=True)
 
         x = torch.randn(1, args.freq_bins, args.frames, 2)

@@ -1,0 +1,13 @@
+Metric,Value
+PESQ (enhanced),1.1139
+PESQ (noisy),1.9709
+PESQ (Δ improvement),-0.8570
+STOI (enhanced),0.6913
+STOI (noisy),0.9210
+STOI (Δ improvement),-0.2297
+SI-SDR enhanced (dB),-14.31
+SI-SDR noisy (dB),8.44
+SI-SDR Δ (dB),-22.76
+RTF (mean),0.388954
+RTF (overall),0.388672
+Real-time capable?,✅ Có

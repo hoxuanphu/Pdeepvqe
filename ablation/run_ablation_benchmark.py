@@ -14,7 +14,12 @@ if __package__ in (None, ""):
 
 import torch
 
-from ablation.ablation_config import get_train_config, reproducibility_metadata
+from ablation.ablation_config import (
+    TRAIN_CONFIG_PRESETS,
+    get_model_config_id,
+    get_train_config,
+    reproducibility_metadata,
+)
 from ablation.deepvqe_ablation import (
     ABLATION_CONFIGS,
     DeepVQE_Ablation,
@@ -148,13 +153,15 @@ def main():
 
     rows = []
     for config_id in args.configs:
+        model_config_id = get_model_config_id(config_id)
         try:
-            get_ablation_config(config_id)
+            get_ablation_config(model_config_id)
         except ValueError as exc:
-            raise ValueError(f"Unknown config {config_id!r}; valid configs: {', '.join(ABLATION_CONFIGS)}") from exc
+            valid = ", ".join(list(ABLATION_CONFIGS) + list(TRAIN_CONFIG_PRESETS))
+            raise ValueError(f"Unknown config {config_id!r}; valid configs: {valid}") from exc
 
-        model = DeepVQE_Ablation.from_config_id(config_id).eval().to(device)
-        stream_model = StreamDeepVQE_Ablation.from_config_id(config_id).eval().to(device)
+        model = DeepVQE_Ablation.from_config_id(model_config_id).eval().to(device)
+        stream_model = StreamDeepVQE_Ablation.from_config_id(model_config_id).eval().to(device)
         convert_ablation_to_stream(stream_model, model, strict=True)
         params = count_parameters(model)
         macs, ptflops_params, notes = try_ptflops(model, args.frames, device)
@@ -196,6 +203,8 @@ def main():
             "pass": False,
             "notes": notes,
         }
+        if model_config_id != config_id:
+            row["notes"] = f"architecture={model_config_id}" + (f" | {notes}" if notes else "")
         row["pass"] = (
             passes_budget(row, args.max_params, args.max_macs, args.max_rtf, args.max_causality_error)
             and row["streaming_parity_error"] <= args.max_streaming_parity_error

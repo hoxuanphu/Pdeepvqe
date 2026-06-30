@@ -25,7 +25,7 @@ from ablation.discriminator import (
     adversarial_g_loss,
     feature_matching_loss,
 )
-from ablation.ablation_config import get_train_config, deep_update
+from ablation.ablation_config import get_model_config_id, get_train_config, deep_update
 from ablation.train_ablation import (
     make_model,
     make_optimizer_scheduler,
@@ -185,6 +185,40 @@ def test_config_gan_params():
     print("OK")
 
 
+def test_d1b_gan_preset():
+    """Test that the best current generator can be trained with GAN loss."""
+    print("[TEST] D1b GRU768 GAN preset...", end=" ")
+
+    cfg = get_train_config("GAN_D1b_gru768")
+    assert get_model_config_id("GAN_D1b_gru768") == "D1b_gru768"
+    assert cfg["experiment"]["config_id"] == "GAN_D1b_gru768"
+    assert cfg["model"]["gru_hidden"] == 768
+    assert cfg["training"]["use_gan"] is True
+    assert cfg["training"]["num_d_scales"] == 3
+    assert cfg["loss"]["lamda_adv"] == 0.05
+    assert cfg["loss"]["lambda_fm"] == 2.0
+
+    print("OK")
+
+
+def test_mamba_gan_preset():
+    """Test that the Phase 2 Mamba generator can be trained with GAN loss."""
+    print("[TEST] Mamba GAN preset...", end=" ")
+
+    cfg = get_train_config("GAN_Mamba_b2_h384")
+    assert get_model_config_id("GAN_Mamba_b2_h384") == "Mamba_b2_h384"
+    assert cfg["experiment"]["config_id"] == "GAN_Mamba_b2_h384"
+    assert cfg["model"]["sequence_model"] == "mamba"
+    assert cfg["model"]["mamba_blocks"] == 2
+    assert cfg["model"]["mamba_hidden"] == 384
+    assert cfg["training"]["use_gan"] is True
+    assert cfg["training"]["num_d_scales"] == 3
+    assert cfg["loss"]["lamda_adv"] == 0.05
+    assert cfg["loss"]["lambda_fm"] == 2.0
+
+    print("OK")
+
+
 def test_make_optimizer_with_gan():
     """Test optimizer/scheduler creation with Discriminator."""
     print("[TEST] Optimizer/Scheduler with GAN...", end=" ")
@@ -336,6 +370,8 @@ def main():
         test_feature_matching_loss,
         test_run_d_wrapper,
         test_config_gan_params,
+        test_d1b_gan_preset,
+        test_mamba_gan_preset,
         test_make_optimizer_with_gan,
         test_checkpoint_save_load_gan,
         test_backward_compatibility,
