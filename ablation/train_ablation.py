@@ -132,6 +132,7 @@ def load_audio(path, sample_rate):
         wav = wav.mean(dim=0, keepdim=True)
     if sr != sample_rate:
         wav = torchaudio.functional.resample(wav, sr, sample_rate)
+    wav = torch.nan_to_num(wav, nan=0.0, posinf=0.0, neginf=0.0).clamp(min=-1.0, max=1.0)
     return wav.squeeze(0)
 
 
@@ -310,21 +311,288 @@ def average(items):
     return {key: sum(item[key] for item in items if key in item) / max(1, sum(key in item for item in items)) for key in keys}
 
 
+def grad_norm(parameters):
+    total = 0.0
+    for param in parameters:
+        if param.grad is not None:
+            value = param.grad.detach().data.norm(2).item()
+            total += value * value
+    return total ** 0.5
+
+
+def to_float(value):
+    if torch.is_tensor(value):
+        return float(value.detach().cpu())
+    return float(value)
+
+
+def optimizer_step_with_guard(model, optimizer, scaler, grad_clip, label, batch_idx=None):
+    if scaler is not None:
+        scaler.unscale_(optimizer)
+
+    norm = float(grad_norm(model.parameters()))
+    if not np.isfinite(norm):
+        location = f" batch {batch_idx}" if batch_idx is not None else ""
+        print(f"  [WARN] Skip {label} optimizer step{location}: non-finite grad_norm={norm}", flush=True)
+        optimizer.zero_grad(set_to_none=True)
+        if scaler is not None:
+            scaler.update()
+        return False, norm
+
+    if grad_clip:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), float(grad_clip))
+    if scaler is not None:
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    return True, norm
+
+
+def first_nonfinite_parameter(model):
+    for name, param in unwrap_model(model).named_parameters():
+        if not torch.isfinite(param.detach()).all():
+            return name
+    return ""
+
+
 def make_loader(manifest, cfg, split, data_root):
     dataset = PairedWaveDataset(manifest, cfg, split, data_root=data_root)
-    return DataLoader(
-        dataset,
-        batch_size=int(cfg["training"]["batch_size"]),
-        shuffle=split == "train",
-        num_workers=int(cfg["data"]["num_workers"]),
-        pin_memory=bool(cfg["data"]["pin_memory"]),
-        drop_last=split == "train",
-        collate_fn=collate_batch,
-    )
+    num_workers = int(cfg["data"]["num_workers"])
+    batch_size = int(cfg["training"]["batch_size"])
+    if split != "train" and cfg["training"].get("valid_batch_size"):
+        batch_size = int(cfg["training"]["valid_batch_size"])
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "shuffle": split == "train",
+        "num_workers": num_workers,
+        "pin_memory": bool(cfg["data"]["pin_memory"]),
+        "drop_last": split == "train",
+        "collate_fn": collate_batch,
+    }
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = bool(cfg["data"].get("persistent_workers", False))
+        loader_kwargs["prefetch_factor"] = int(cfg["data"].get("prefetch_factor", 2))
+    return DataLoader(dataset, **loader_kwargs)
 
 
 def unwrap_model(model):
     return model.module if isinstance(model, torch.nn.DataParallel) else model
+
+
+def init_wandb(cfg, model, output_dir, total_params, trainable_params):
+    if not bool(cfg.get("logging", {}).get("use_wandb", False)):
+        return None
+    try:
+        import wandb
+    except ImportError:
+        print("WandB logging requested but wandb is not installed; continuing without it.", flush=True)
+        return None
+
+    try:
+        metadata = reproducibility_metadata(cfg, checkpoint_id="wandb")
+        run = wandb.init(
+            project=cfg["logging"].get("wandb_project", "DeepVQE-Ablation"),
+            name=cfg["experiment"].get("name"),
+            config=cfg,
+            dir=str(output_dir),
+            resume="allow",
+            tags=cfg["logging"].get("wandb_tags", []),
+            notes=cfg["logging"].get("wandb_notes", ""),
+        )
+        wandb.config.update(
+            {
+                "total_params": int(total_params),
+                "trainable_params": int(trainable_params),
+                "output_dir": str(output_dir),
+                "metadata": metadata,
+                "config_hash": metadata.get("config_hash", ""),
+                "git_commit": metadata.get("git_commit", ""),
+                "torch_version": metadata.get("torch_version", ""),
+                "hardware": json.loads(metadata.get("hardware_info", "{}") or "{}"),
+            },
+            allow_val_change=True,
+        )
+        try:
+            wandb.define_metric("epoch")
+            for prefix in ("train", "valid", "metrics", "gan", "lr", "time", "checkpoint", "monitor", "scheduler"):
+                wandb.define_metric(f"{prefix}/*", step_metric="epoch")
+        except Exception:
+            pass
+        if bool(cfg["logging"].get("wandb_watch", False)):
+            wandb.watch(unwrap_model(model), log="gradients", log_freq=int(cfg["logging"].get("wandb_watch_log_freq", 100)))
+        return run
+    except Exception as exc:
+        print(f"WandB init failed; continuing without it. Error: {exc}", flush=True)
+        return None
+
+
+def wandb_log_epoch(wandb_run, epoch, train_metrics, valid_metrics, lr, elapsed_s, monitor, best_metric, bad_epochs, is_best, use_gan=False, lr_d=None, scheduler_metrics=None):
+    if wandb_run is None:
+        return
+    import wandb
+
+    payload = {
+        "epoch": epoch,
+        "lr/generator": lr,
+        "time/epoch_sec": elapsed_s,
+        "checkpoint/best_metric": best_metric,
+        "checkpoint/bad_epochs": bad_epochs,
+        "checkpoint/is_best": int(bool(is_best)),
+        f"monitor/{monitor}": valid_metrics.get(monitor),
+    }
+    if lr_d is not None:
+        payload["lr/discriminator"] = lr_d
+    if scheduler_metrics:
+        for key, value in scheduler_metrics.items():
+            payload[f"scheduler/{key}"] = value
+    for key, value in train_metrics.items():
+        payload[f"train/{key}"] = value
+    for key, value in valid_metrics.items():
+        payload[f"valid/{key}"] = value
+    if use_gan:
+        for key in ("loss_D", "loss_adv", "loss_fm", "loss_G"):
+            if key in train_metrics:
+                payload[f"gan/train_{key}"] = train_metrics[key]
+            if key in valid_metrics:
+                payload[f"gan/valid_{key}"] = valid_metrics[key]
+    for key in ("pesq", "stoi", "pesq_samples", "stoi_samples"):
+        if key in valid_metrics:
+            payload[f"metrics/{key}"] = valid_metrics[key]
+    payload = {key: value for key, value in payload.items() if value is not None}
+    wandb.log(payload, step=epoch)
+
+
+@torch.no_grad()
+def compute_pesq_stoi(model, dataloader, cfg, window, device, max_samples=50):
+    try:
+        from pesq import pesq
+        from pystoi import stoi
+    except ImportError as exc:
+        print(f"PESQ/STOI requested but pesq or pystoi is not installed; skipping. Error: {exc}", flush=True)
+        return {}
+
+    max_samples = int(max_samples or 0)
+    if max_samples <= 0:
+        return {}
+
+    was_training = model.training
+    model.eval()
+    sample_rate = int(cfg["data"]["sample_rate"])
+    amp_enabled = bool(cfg["training"].get("use_amp", False)) and device.type == "cuda"
+    pesq_scores = []
+    stoi_scores = []
+    seen = 0
+
+    try:
+        for batch in dataloader:
+            mixture = batch["mixture"].to(device)
+            target = batch["target"].to(device)
+            mixture_spec = make_stft(mixture, cfg, window)
+            with autocast_context("cuda", enabled=amp_enabled):
+                estimate_spec = model(mixture_spec)
+            estimate = make_istft(estimate_spec.float(), cfg, window, mixture.shape[-1])
+
+            for idx in range(estimate.shape[0]):
+                clean = target[idx].detach().cpu().numpy()
+                enhanced = estimate[idx].detach().cpu().numpy()
+                min_len = min(clean.shape[-1], enhanced.shape[-1])
+                if min_len <= 0:
+                    continue
+                clean = np.asarray(clean[:min_len], dtype=np.float32)
+                enhanced = np.asarray(enhanced[:min_len], dtype=np.float32)
+                clean = np.nan_to_num(clean)
+                enhanced = np.nan_to_num(enhanced)
+                try:
+                    pesq_scores.append(float(pesq(sample_rate, clean, enhanced, "wb")))
+                except Exception:
+                    pass
+                try:
+                    stoi_scores.append(float(stoi(clean, enhanced, sample_rate, extended=False)))
+                except Exception:
+                    pass
+                seen += 1
+                if seen >= max_samples:
+                    break
+            if seen >= max_samples:
+                break
+    finally:
+        model.train(was_training)
+
+    metrics = {}
+    if pesq_scores:
+        metrics["pesq"] = float(np.mean(pesq_scores))
+    if stoi_scores:
+        metrics["stoi"] = float(np.mean(stoi_scores))
+    metrics["pesq_samples"] = float(len(pesq_scores))
+    metrics["stoi_samples"] = float(len(stoi_scores))
+    return metrics
+
+
+def log_audio_to_wandb(wandb_run, model, dataloader, cfg, window, device, epoch):
+    if wandb_run is None:
+        return
+    try:
+        import matplotlib.pyplot as plt
+        import wandb
+    except ImportError as exc:
+        print(f"Audio/spectrogram WandB logging requested but dependencies are missing; skipping. Error: {exc}", flush=True)
+        return
+
+    max_items = int(cfg.get("logging", {}).get("log_audio_samples", 1) or 1)
+    max_items = max(1, max_items)
+    sample_rate = int(cfg["data"]["sample_rate"])
+    amp_enabled = bool(cfg["training"].get("use_amp", False)) and device.type == "cuda"
+    was_training = model.training
+    model.eval()
+
+    try:
+        batch = next(iter(dataloader))
+    except StopIteration:
+        model.train(was_training)
+        return
+
+    try:
+        with torch.no_grad():
+            mixture = batch["mixture"].to(device)
+            target = batch["target"].to(device)
+            mixture_spec = make_stft(mixture, cfg, window)
+            with autocast_context("cuda", enabled=amp_enabled):
+                estimate_spec = model(mixture_spec)
+            estimate = make_istft(estimate_spec.float(), cfg, window, mixture.shape[-1])
+
+        payload = {"epoch": epoch}
+        count = min(max_items, estimate.shape[0])
+        for idx in range(count):
+            noisy = mixture[idx].detach().cpu().numpy()
+            clean = target[idx].detach().cpu().numpy()
+            enhanced = estimate[idx].detach().cpu().numpy()
+            min_len = min(noisy.shape[-1], clean.shape[-1], enhanced.shape[-1])
+            noisy = np.nan_to_num(noisy[:min_len].astype(np.float32))
+            clean = np.nan_to_num(clean[:min_len].astype(np.float32))
+            enhanced = np.nan_to_num(enhanced[:min_len].astype(np.float32))
+
+            suffix = "" if count == 1 else f"/sample_{idx}"
+            payload[f"audio{suffix}/clean"] = wandb.Audio(clean, sample_rate=sample_rate)
+            payload[f"audio{suffix}/noisy"] = wandb.Audio(noisy, sample_rate=sample_rate)
+            payload[f"audio{suffix}/enhanced"] = wandb.Audio(enhanced, sample_rate=sample_rate)
+
+            fig, axes = plt.subplots(3, 1, figsize=(10, 7), sharex=True)
+            for axis, wav, title in zip(axes, (clean, noisy, enhanced), ("Clean", "Noisy", "Enhanced")):
+                axis.specgram(wav, Fs=sample_rate, NFFT=512, noverlap=256, cmap="magma")
+                axis.set_title(title)
+                axis.set_ylabel("Hz")
+            axes[-1].set_xlabel("Time")
+            fig.tight_layout()
+            payload[f"spectrograms{suffix}"] = wandb.Image(fig)
+            plt.close(fig)
+
+        wandb.log(payload, step=epoch)
+    except Exception as exc:
+        print(f"WandB audio/spectrogram logging failed at epoch {epoch}: {exc}", flush=True)
+    finally:
+        model.train(was_training)
 
 
 def save_checkpoint(path, model, optimizer, scheduler, cfg, epoch, best_metric, bad_epochs=0, scaler=None, model_D=None, opt_D=None, scaler_D=None, scheduler_D=None):
@@ -443,7 +711,14 @@ def run_epoch(model, loader, cfg, window, device, optimizer=None, scaler=None, d
     
     accum_steps = int(cfg["training"].get("grad_accum_steps", 1)) if train else 1
     valid_accum_batches = 0
-    progress_every = int(cfg["training"].get("progress_update_every", 1))
+    skipped_batches = 0
+    skipped_optimizer_steps = 0
+    skipped_optimizer_steps_D = 0
+    consecutive_nonfinite = 0
+    optimizer_steps = 0
+    grad_norms = []
+    grad_norms_D = []
+    progress_every = max(1, int(cfg["training"].get("progress_update_every", 1)))
 
     if tqdm is not None and not cfg["training"].get("disable_tqdm", False):
         iterator = tqdm(loader, desc=desc_str, dynamic_ncols=True, leave=False, ascii=True)
@@ -461,11 +736,21 @@ def run_epoch(model, loader, cfg, window, device, optimizer=None, scaler=None, d
         
         if not torch.isfinite(loss_G_base):
             print(f"  [WARN] Skip batch {batch_idx}: non-finite loss", flush=True)
+            skipped_batches += 1
+            consecutive_nonfinite += 1
             if train:
                 optimizer.zero_grad(set_to_none=True)
                 if use_gan:
                     opt_D.zero_grad(set_to_none=True)
+            max_bad = int(cfg["training"].get("max_consecutive_nonfinite_batches", 25))
+            if max_bad > 0 and consecutive_nonfinite >= max_bad:
+                print(
+                    f"  [WARN] Stop epoch early: {consecutive_nonfinite} consecutive non-finite batches.",
+                    flush=True,
+                )
+                break
             continue
+        consecutive_nonfinite = 0
             
         if train:
             if use_gan:
@@ -537,29 +822,31 @@ def run_epoch(model, loader, cfg, window, device, optimizer=None, scaler=None, d
             if valid_accum_batches % accum_steps == 0:
                 grad_clip = cfg["optimizer"].get("grad_clip_norm")
                 if use_gan:
-                    if scaler_D is not None:
-                        if grad_clip:
-                            scaler_D.unscale_(opt_D)
-                            torch.nn.utils.clip_grad_norm_(model_D.parameters(), float(grad_clip))
-                        scaler_D.step(opt_D)
-                        scaler_D.update()
-                    else:
-                        if grad_clip:
-                            torch.nn.utils.clip_grad_norm_(model_D.parameters(), float(grad_clip))
-                        opt_D.step()
-                    opt_D.zero_grad(set_to_none=True)
+                    stepped_D, d_norm = optimizer_step_with_guard(
+                        model_D,
+                        opt_D,
+                        scaler_D,
+                        grad_clip,
+                        "D",
+                        batch_idx=batch_idx,
+                    )
+                    grad_norms_D.append(float(d_norm) if np.isfinite(d_norm) else float("nan"))
+                    if not stepped_D:
+                        skipped_optimizer_steps_D += 1
                     
-                if scaler is not None:
-                    if grad_clip:
-                        scaler.unscale_(optimizer)
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), float(grad_clip))
-                    scaler.step(optimizer)
-                    scaler.update()
+                stepped_G, g_norm = optimizer_step_with_guard(
+                    model,
+                    optimizer,
+                    scaler,
+                    grad_clip,
+                    "G",
+                    batch_idx=batch_idx,
+                )
+                grad_norms.append(float(g_norm) if np.isfinite(g_norm) else float("nan"))
+                if stepped_G:
+                    optimizer_steps += 1
                 else:
-                    if grad_clip:
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), float(grad_clip))
-                    optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
+                    skipped_optimizer_steps += 1
                 
         else:
             if use_gan:
@@ -616,34 +903,56 @@ def run_epoch(model, loader, cfg, window, device, optimizer=None, scaler=None, d
     if train and valid_accum_batches % accum_steps != 0:
         grad_clip = cfg["optimizer"].get("grad_clip_norm")
         if use_gan:
-            if scaler_D is not None:
-                if grad_clip:
-                    scaler_D.unscale_(opt_D)
-                    torch.nn.utils.clip_grad_norm_(model_D.parameters(), float(grad_clip))
-                scaler_D.step(opt_D)
-                scaler_D.update()
-            else:
-                if grad_clip:
-                    torch.nn.utils.clip_grad_norm_(model_D.parameters(), float(grad_clip))
-                opt_D.step()
-            opt_D.zero_grad(set_to_none=True)
+            stepped_D, d_norm = optimizer_step_with_guard(
+                model_D,
+                opt_D,
+                scaler_D,
+                grad_clip,
+                "D",
+            )
+            grad_norms_D.append(float(d_norm) if np.isfinite(d_norm) else float("nan"))
+            if not stepped_D:
+                skipped_optimizer_steps_D += 1
             
-        if scaler is not None:
-            if grad_clip:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), float(grad_clip))
-            scaler.step(optimizer)
-            scaler.update()
+        stepped_G, g_norm = optimizer_step_with_guard(
+            model,
+            optimizer,
+            scaler,
+            grad_clip,
+            "G",
+        )
+        grad_norms.append(float(g_norm) if np.isfinite(g_norm) else float("nan"))
+        if stepped_G:
+            optimizer_steps += 1
         else:
-            if grad_clip:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), float(grad_clip))
-            optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
+            skipped_optimizer_steps += 1
         
     gc.collect()
     if not values:
-        return {"loss": float('nan'), "ri_loss": float('nan'), "mag_loss": float('nan'), "sisnr": float('nan')}
-    return average(values)
+        result = {"loss": float('nan'), "ri_loss": float('nan'), "mag_loss": float('nan'), "sisnr": float('nan')}
+    else:
+        result = average(values)
+    result["skipped_batches"] = float(skipped_batches)
+    result["valid_batches"] = float(len(values))
+    result["total_batches"] = float(len(loader))
+    result["nonfinite_batches"] = float(skipped_batches)
+    result["has_nan"] = float(skipped_batches > 0 or not np.isfinite(result.get("loss", float("nan"))))
+    if train:
+        result["optimizer_steps"] = float(optimizer_steps)
+        result["skipped_optimizer_steps"] = float(skipped_optimizer_steps)
+        finite_grad_norms = [value for value in grad_norms if np.isfinite(value)]
+        result["grad_norm"] = float(np.mean(finite_grad_norms)) if finite_grad_norms else 0.0
+        result["grad_norm_max"] = float(np.max(finite_grad_norms)) if finite_grad_norms else 0.0
+        if use_gan:
+            result["skipped_optimizer_steps_D"] = float(skipped_optimizer_steps_D)
+            finite_grad_norms_D = [value for value in grad_norms_D if np.isfinite(value)]
+            result["grad_norm_D"] = float(np.mean(finite_grad_norms_D)) if finite_grad_norms_D else 0.0
+            result["grad_norm_D_max"] = float(np.max(finite_grad_norms_D)) if finite_grad_norms_D else 0.0
+        if scaler is not None:
+            result["amp_scale"] = float(scaler.get_scale())
+        if scaler_D is not None:
+            result["amp_scale_D"] = float(scaler_D.get_scale())
+    return result
 
 
 def main():
@@ -755,11 +1064,26 @@ def main():
     trainable_params = sum(p.numel() for p in unwrap_model(model).parameters() if p.requires_grad)
     print(f"Total params: {total_params / 1e6:.2f}M | Trainable: {trainable_params / 1e6:.2f}M", flush=True)
     print(f"Mixed Precision (AMP): {'ON' if use_amp else 'OFF'}", flush=True)
+    wandb_run = init_wandb(cfg, model, output_dir, total_params, trainable_params)
     if use_gan:
         d_params = sum(p.numel() for p in unwrap_model(model_D).parameters())
         d_type = "MultiScaleDiscriminator" if num_d_scales > 1 else "Discriminator"
         fm_info = f", FM lambda={cfg['loss'].get('lambda_fm', 0.0)}" if float(cfg["loss"].get("lambda_fm", 0.0)) > 0 else ""
         print(f"GAN: {d_type} ({d_params/1e3:.1f}K params, {num_d_scales} scale(s){fm_info})", flush=True)
+        if wandb_run is not None:
+            try:
+                import wandb
+
+                wandb.config.update(
+                    {
+                        "discriminator_type": d_type,
+                        "discriminator_params": int(d_params),
+                        "discriminator_scales": int(num_d_scales),
+                    },
+                    allow_val_change=True,
+                )
+            except Exception:
+                pass
     
     aug_cfg = cfg["data"].get("augment", False)
     if aug_cfg:
@@ -778,6 +1102,13 @@ def main():
     if cfg["experiment"].get("resume_from"):
         try:
             start_epoch, best_metric, bad_epochs = load_checkpoint(cfg["experiment"]["resume_from"], model, optimizer, scheduler, device, scaler=scaler, model_D=model_D, opt_D=opt_D, scaler_D=scaler_D, scheduler_D=scheduler_D)
+            bad_param = first_nonfinite_parameter(model)
+            if bad_param:
+                raise RuntimeError(f"Resume checkpoint contains non-finite generator parameter: {bad_param}")
+            if model_D is not None:
+                bad_param_D = first_nonfinite_parameter(model_D)
+                if bad_param_D:
+                    raise RuntimeError(f"Resume checkpoint contains non-finite discriminator parameter: {bad_param_D}")
             print(
                 f"Resumed from {cfg['experiment']['resume_from']} at epoch={start_epoch} "
                 f"best_metric={best_metric} bad_epochs={bad_epochs}",
@@ -829,21 +1160,97 @@ def main():
         epoch_str_train = f"Epoch {epoch:>2} [Train]"
         epoch_str_valid = f"Epoch {epoch:>2} [Valid]"
         train_metrics = run_epoch(model, train_loader, cfg, window, device, optimizer, scaler, desc_str=epoch_str_train, model_D=model_D, opt_D=opt_D, scaler_D=scaler_D)
+        bad_param = first_nonfinite_parameter(model)
+        bad_param_D = first_nonfinite_parameter(model_D) if model_D is not None else ""
+        if bad_param or bad_param_D:
+            elapsed = time.time() - start
+            target = f"generator parameter {bad_param}" if bad_param else f"discriminator parameter {bad_param_D}"
+            log_str = (
+                f"Epoch {epoch:>3}/{cfg['training']['epochs']} | "
+                f"non-finite {target} after train; stopping before validation/checkpoint | "
+                f"train_skipped={train_metrics.get('skipped_batches', 0):.0f} | "
+                f"Time: {elapsed:.0f}s"
+            )
+            print(log_str, flush=True)
+            with open(output_dir / "train_log.txt", "a", encoding="utf-8") as f:
+                f.write(log_str + "\n")
+            wandb_log_epoch(
+                wandb_run,
+                epoch,
+                train_metrics,
+                {},
+                optimizer.param_groups[0]["lr"],
+                elapsed,
+                monitor,
+                best_metric,
+                bad_epochs,
+                False,
+                use_gan=use_gan,
+                lr_d=opt_D.param_groups[0]["lr"] if use_gan and opt_D is not None else None,
+                scheduler_metrics={"nonfinite_parameter": 1.0},
+            )
+            break
         with torch.no_grad():
             valid_metrics = run_epoch(model, valid_loader, cfg, window, device, desc_str=epoch_str_valid, model_D=model_D)
+        eval_every = int(cfg.get("logging", {}).get("eval_pesq_every", 0) or 0)
+        if eval_every > 0 and epoch % eval_every == 0:
+            pesq_stoi = compute_pesq_stoi(
+                model,
+                valid_loader,
+                cfg,
+                window,
+                device,
+                max_samples=cfg.get("logging", {}).get("eval_pesq_samples", 50),
+            )
+            valid_metrics.update(pesq_stoi)
         monitor_value = valid_metrics.get(monitor, -valid_metrics["loss"])
+        if not np.isfinite(float(monitor_value)):
+            elapsed = time.time() - start
+            log_str = (
+                f"Epoch {epoch:>3}/{cfg['training']['epochs']} | "
+                f"non-finite monitor {monitor}={monitor_value}; stopping before scheduler/checkpoint update | "
+                f"train_skipped={train_metrics.get('skipped_batches', 0):.0f} "
+                f"valid_skipped={valid_metrics.get('skipped_batches', 0):.0f} | "
+                f"Time: {elapsed:.0f}s"
+            )
+            print(log_str, flush=True)
+            with open(output_dir / "train_log.txt", "a", encoding="utf-8") as f:
+                f.write(log_str + "\n")
+            wandb_log_epoch(
+                wandb_run,
+                epoch,
+                train_metrics,
+                valid_metrics,
+                optimizer.param_groups[0]["lr"],
+                elapsed,
+                monitor,
+                best_metric,
+                bad_epochs,
+                False,
+                use_gan=use_gan,
+                lr_d=opt_D.param_groups[0]["lr"] if use_gan and opt_D is not None else None,
+                scheduler_metrics={"nonfinite_monitor": 1.0},
+            )
+            break
         
         prev_lr = optimizer.param_groups[0]['lr']
         scheduler.step(monitor_value)
         current_lr = optimizer.param_groups[0]['lr']
         if current_lr < prev_lr:
             print(f"  >>> Scheduler giảm LR: {prev_lr:.2e} -> {current_lr:.2e}", flush=True)
+        scheduler_metrics = {
+            "num_bad_epochs": getattr(scheduler, "num_bad_epochs", None),
+            "patience": int(cfg["scheduler"]["patience"]),
+            "factor": float(cfg["scheduler"]["factor"]),
+            "min_lr": float(cfg["scheduler"]["min_lr"]),
+        }
         if use_gan and scheduler_D is not None:
             prev_lr_D = opt_D.param_groups[0]['lr']
             scheduler_D.step(monitor_value)
             current_lr_D = opt_D.param_groups[0]['lr']
             if current_lr_D < prev_lr_D:
                 print(f"  >>> Scheduler D giảm LR: {prev_lr_D:.2e} -> {current_lr_D:.2e}", flush=True)
+            scheduler_metrics["num_bad_epochs_D"] = getattr(scheduler_D, "num_bad_epochs", None)
             
         previous_best = best_metric
         if mode == "max":
@@ -864,25 +1271,50 @@ def main():
             print(f"  >>> Saved best model ({monitor}={best_metric:.6f})", flush=True)
             
         current_lr = optimizer.param_groups[0]['lr']
+        elapsed = time.time() - start
+        scheduler_bad_epochs = scheduler_metrics.get("num_bad_epochs")
         if use_gan:
             log_str = (
                 f"Epoch {epoch:>3}/{cfg['training']['epochs']} | "
                 f"Train Loss: {train_metrics['loss']:.6f} (D={train_metrics.get('loss_D', 0):.4f}, adv={train_metrics.get('loss_adv', 0):.4f}, fm={train_metrics.get('loss_fm', 0):.4f}, ri={train_metrics['ri_loss']:.4f}, sisnr={train_metrics['sisnr']:.4f}) | "
                 f"Valid Loss: {valid_metrics['loss']:.6f} (D={valid_metrics.get('loss_D', 0):.4f}, adv={valid_metrics.get('loss_adv', 0):.4f}, fm={valid_metrics.get('loss_fm', 0):.4f}, ri={valid_metrics['ri_loss']:.4f}, sisnr={valid_metrics['sisnr']:.4f}) | "
-                f"LR: {current_lr:.2e} | Time: {int(time.time() - start)}s"
+                f"LR: {current_lr:.2e} | Sched bad: {scheduler_bad_epochs}/{cfg['scheduler']['patience']} | Time: {elapsed:.0f}s"
             )
         else:
             log_str = (
                 f"Epoch {epoch:>3}/{cfg['training']['epochs']} | "
                 f"Train Loss: {train_metrics['loss']:.6f} (ri={train_metrics['ri_loss']:.4f}, mag={train_metrics['mag_loss']:.4f}, sisnr={train_metrics['sisnr']:.4f}) | "
                 f"Valid Loss: {valid_metrics['loss']:.6f} (ri={valid_metrics['ri_loss']:.4f}, mag={valid_metrics['mag_loss']:.4f}, sisnr={valid_metrics['sisnr']:.4f}) | "
-                f"LR: {current_lr:.2e} | Time: {int(time.time() - start)}s"
+                f"LR: {current_lr:.2e} | Sched bad: {scheduler_bad_epochs}/{cfg['scheduler']['patience']} | Time: {elapsed:.0f}s"
+            )
+        if "pesq" in valid_metrics or "stoi" in valid_metrics:
+            log_str += (
+                f" | PESQ: {valid_metrics.get('pesq', float('nan')):.4f}"
+                f" | STOI: {valid_metrics.get('stoi', float('nan')):.4f}"
             )
         print(log_str, flush=True)
         
         # Ghi log ra file
         with open(output_dir / "train_log.txt", "a", encoding="utf-8") as f:
             f.write(log_str + "\n")
+        wandb_log_epoch(
+            wandb_run,
+            epoch,
+            train_metrics,
+            valid_metrics,
+            current_lr,
+            elapsed,
+            monitor,
+            best_metric,
+            bad_epochs,
+            is_best,
+            use_gan=use_gan,
+            lr_d=opt_D.param_groups[0]["lr"] if use_gan and opt_D is not None else None,
+            scheduler_metrics=scheduler_metrics,
+        )
+        log_audio_every = int(cfg.get("logging", {}).get("log_audio_every", 0) or 0)
+        if log_audio_every > 0 and epoch % log_audio_every == 0:
+            log_audio_to_wandb(wandb_run, model, valid_loader, cfg, window, device, epoch)
         if early_stop_patience is not None and epoch >= early_stop_min_epochs and bad_epochs >= early_stop_patience:
             print(
                 f"Early stopping {args.config_id}: {monitor} did not improve by "
@@ -891,6 +1323,16 @@ def main():
                 flush=True,
             )
             break
+
+    if wandb_run is not None:
+        try:
+            import wandb
+
+            wandb.summary["best_metric"] = best_metric
+            wandb.summary["output_dir"] = str(output_dir)
+            wandb.finish()
+        except Exception as exc:
+            print(f"WandB finish failed: {exc}", flush=True)
 
 
 if __name__ == "__main__":

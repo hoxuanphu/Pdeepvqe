@@ -15,10 +15,14 @@ model:
   mamba_state: 16
   mamba_conv: 4
   mamba_expand: 2
+optimizer:
+  lr: 3e-4
+  grad_clip_norm: 1.0
 training:
+  use_amp: false
   use_gan: true
   num_d_scales: 3
+  max_consecutive_nonfinite_batches: 25
 loss:
   lamda_adv: 0.05
   lambda_fm: 2.0
-

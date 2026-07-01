@@ -38,6 +38,8 @@ BASE_TRAIN_CONFIG = {
         "sample_rate": 16000,
         "clip_seconds": 3.0,
         "num_workers": 2,
+        "persistent_workers": False,
+        "prefetch_factor": 2,
         "pin_memory": True,
         "train_manifest": "data/manifests/train.jsonl",
         "valid_manifest": "data/manifests/valid.jsonl",
@@ -62,13 +64,22 @@ BASE_TRAIN_CONFIG = {
     "logging": {
         "use_wandb": True,
         "wandb_project": "DeepVQE-Ablation",
+        "wandb_tags": [],
+        "wandb_notes": "",
+        "wandb_watch": False,
+        "wandb_watch_log_freq": 100,
         "eval_pesq_every": 5,
         "eval_pesq_samples": 50,
         "log_audio_every": 5,
+        "log_audio_samples": 1,
     },
     "training": {
         "device": "cuda",
         "batch_size": 8,
+        "valid_batch_size": None,
+        "grad_accum_steps": 1,
+        "progress_update_every": 1,
+        "max_consecutive_nonfinite_batches": 25,
         "epochs": 100,
         "checkpoint_monitor": "loss",
         "checkpoint_mode": "min",
@@ -87,6 +98,17 @@ BASE_TRAIN_CONFIG = {
 
 
 TRAIN_CONFIG_PRESETS = {
+    "Mamba_b2_h384": {
+        "base_config_id": "Mamba_b2_h384",
+        "optimizer": {
+            "lr": 3e-4,
+            "grad_clip_norm": 1.0,
+        },
+        "training": {
+            "use_amp": False,
+            "max_consecutive_nonfinite_batches": 25,
+        },
+    },
     "GAN_Baseline": {
         "base_config_id": "Baseline",
         "training": {
@@ -122,9 +144,15 @@ TRAIN_CONFIG_PRESETS = {
     },
     "GAN_Mamba_b2_h384": {
         "base_config_id": "Mamba_b2_h384",
+        "optimizer": {
+            "lr": 3e-4,
+            "grad_clip_norm": 1.0,
+        },
         "training": {
+            "use_amp": False,
             "use_gan": True,
             "num_d_scales": 3,
+            "max_consecutive_nonfinite_batches": 25,
         },
         "loss": {
             "lamda_adv": 0.05,

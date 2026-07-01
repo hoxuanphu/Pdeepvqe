@@ -31,6 +31,8 @@ class NativeMambaBlock(nn.Module):
         dt_min=0.001,
         dt_max=0.1,
         dt_init_floor=1e-4,
+        ssm_state_clip=1e4,
+        ssm_param_clip=10.0,
     ):
         super().__init__()
         self.d_model = int(d_model)
@@ -38,6 +40,10 @@ class NativeMambaBlock(nn.Module):
         self.d_conv = int(d_conv)
         self.expand = int(expand)
         self.d_inner = self.d_model * self.expand
+        self.dt_max = float(dt_max)
+        self.dt_min = float(dt_init_floor)
+        self.ssm_state_clip = float(ssm_state_clip)
+        self.ssm_param_clip = float(ssm_param_clip)
         if self.d_state < 1:
             raise ValueError("d_state must be >= 1")
         if self.d_conv < 1:
@@ -70,6 +76,7 @@ class NativeMambaBlock(nn.Module):
         inv_dt = dt + torch.log(-torch.expm1(-dt))
         with torch.no_grad():
             self.dt_proj.bias.copy_(inv_dt)
+        nn.init.normal_(self.out_proj.weight, mean=0.0, std=1e-3)
 
     def init_cache(self, batch_size, device=None, dtype=None):
         conv_len = max(0, self.d_conv - 1)
@@ -89,6 +96,14 @@ class NativeMambaBlock(nn.Module):
         )
         return conv_cache, ssm_state
 
+    def _sanitize(self, tensor):
+        return torch.nan_to_num(
+            tensor,
+            nan=0.0,
+            posinf=self.ssm_state_clip,
+            neginf=-self.ssm_state_clip,
+        ).clamp(min=-self.ssm_state_clip, max=self.ssm_state_clip)
+
     def _ssm_step(self, x, ssm_state):
         x_proj = self.x_proj(x)
         dt, b, c = torch.split(
@@ -96,14 +111,20 @@ class NativeMambaBlock(nn.Module):
             [self.dt_rank, self.d_state, self.d_state],
             dim=-1,
         )
-        dt = F.softplus(self.dt_proj(dt))
-        a = -torch.exp(self.A_log.float()).to(dtype=x.dtype, device=x.device)
-        d_a = torch.exp(dt.unsqueeze(-1) * a.unsqueeze(0))
+        x_float = x.float()
+        state_float = ssm_state.float()
+        dt = F.softplus(self.dt_proj(dt.float())).clamp(min=self.dt_min, max=self.dt_max)
+        b = b.float().clamp(min=-self.ssm_param_clip, max=self.ssm_param_clip)
+        c = c.float().clamp(min=-self.ssm_param_clip, max=self.ssm_param_clip)
+        a = -torch.exp(self.A_log.float()).clamp(max=1e4)
+        d_a = torch.exp((dt.unsqueeze(-1) * a.unsqueeze(0)).clamp(min=-60.0, max=0.0))
         d_b = dt.unsqueeze(-1) * b.unsqueeze(1)
-        ssm_state = ssm_state * d_a + x.unsqueeze(-1) * d_b
-        y = torch.sum(ssm_state * c.unsqueeze(1), dim=-1)
-        y = y + x * self.D.to(dtype=x.dtype, device=x.device)
-        return y, ssm_state
+        state_float = state_float * d_a + x_float.unsqueeze(-1) * d_b
+        state_float = self._sanitize(state_float)
+        y = torch.sum(state_float * c.unsqueeze(1), dim=-1)
+        y = y + x_float * self.D.float()
+        y = self._sanitize(y)
+        return y.to(dtype=x.dtype), state_float
 
     def _causal_conv(self, x, conv_cache=None):
         x_t = x.transpose(1, 2)
@@ -142,6 +163,7 @@ class NativeMambaBlock(nn.Module):
         y = torch.stack(outputs, dim=1)
         y = y * self.activation(z)
         y = self.out_proj(y)
+        y = self._sanitize(y)
 
         conv_len = max(0, self.d_conv - 1)
         if conv_len > 0:
@@ -174,6 +196,7 @@ class NativeMambaBlock(nn.Module):
         y, ssm_state = self._ssm_step(x_conv, ssm_state)
         y = y * self.activation(z)
         y = self.out_proj(y)
+        y = self._sanitize(y)
         return y, (conv_cache, ssm_state)
 
 

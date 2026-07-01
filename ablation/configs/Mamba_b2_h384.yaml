@@ -15,4 +15,9 @@ model:
   mamba_state: 16
   mamba_conv: 4
   mamba_expand: 2
-
+optimizer:
+  lr: 3e-4
+  grad_clip_norm: 1.0
+training:
+  use_amp: false
+  max_consecutive_nonfinite_batches: 25
